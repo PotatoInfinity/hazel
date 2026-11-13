@@ -1,13 +1,19 @@
 import SwiftUI
 import AppKit
 
+extension Notification.Name {
+    /// Posted by WallpaperController.scheduleCycle() so the menu bar titles
+    /// stay in sync when intervals change from the Settings panel.
+    static let hazelCycleSettingsChanged = Notification.Name("com.live.hazel.cycleSettingsChanged")
+}
+
 @main
 struct LiveWallpaperApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) var appDelegate
 
     var body: some Scene {
         Settings {
-            EmptyView()
+            SettingsView()
         }
     }
 }
@@ -23,9 +29,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         
         let wallpaperStore = WallpaperStore()
         self.store = wallpaperStore
+        AppContext.shared.store = wallpaperStore
 
         let wallpaperController = WallpaperController(store: wallpaperStore)
         self.controller = wallpaperController
+        AppContext.shared.controller = wallpaperController
 
         if let activeItem = wallpaperStore.activeWallpaper {
             wallpaperController.setWallpaper(activeItem)
@@ -33,7 +41,19 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
         setupStatusItem()
 
+        NotificationCenter.default.addObserver(
+            forName: .hazelCycleSettingsChanged,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            self?.refreshCycleMenu()
+        }
+
         managementWindowController = ManagementWindowController()
+
+        Task {
+            await ScreensaverSelectService.shared.ensureAutomatic()
+        }
     }
     
     private func registerFonts() {
@@ -72,6 +92,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         openItem.target = self
         menu.addItem(openItem)
 
+        let settingsItem = NSMenuItem(title: "Settings…", action: #selector(openSettings), keyEquivalent: ",")
+        settingsItem.target = self
+        menu.addItem(settingsItem)
+
         menu.addItem(NSMenuItem.separator())
 
         let fitMenu = NSMenu()
@@ -94,6 +118,35 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         startupItem.state = SettingsManager.shared.openOnStartup ? .on : .off
         menu.addItem(startupItem)
 
+        let syncItem = NSMenuItem(title: "Sync system wallpaper", action: #selector(toggleSyncWallpaper(_:)), keyEquivalent: "")
+        syncItem.target = self
+        syncItem.state = SettingsManager.shared.syncSystemWallpaper ? .on : .off
+        menu.addItem(syncItem)
+
+        let useSaverItem = NSMenuItem(title: "Use Hazel for screensaver and lockscreen", action: #selector(useHazelAsScreensaver(_:)), keyEquivalent: "")
+        useSaverItem.target = self
+        menu.addItem(useSaverItem)
+
+        let lockscreenItem = NSMenuItem(title: "Use video as lockscreen", action: #selector(toggleVideoLockscreen(_:)), keyEquivalent: "")
+        lockscreenItem.target = self
+        menu.addItem(lockscreenItem)
+
+        let cycleMenu = NSMenu()
+        for (title, id) in AppDelegate.cycleMenuEntries() {
+            if title.isEmpty {
+                cycleMenu.addItem(NSMenuItem.separator())
+                continue
+            }
+            let item = NSMenuItem(title: title, action: #selector(cycleSelected(_:)), keyEquivalent: "")
+            item.target = self
+            item.representedObject = id as NSString
+            cycleMenu.addItem(item)
+        }
+
+        let cycleItem = NSMenuItem(title: "Cycle Wallpaper", action: nil, keyEquivalent: "")
+        cycleItem.submenu = cycleMenu
+        menu.addItem(cycleItem)
+
         menu.addItem(NSMenuItem.separator())
 
         let quitItem = NSMenuItem(title: "Quit", action: #selector(quitApp), keyEquivalent: "q")
@@ -110,6 +163,34 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     @objc private func openManagement() {
         guard let store = store, let controller = controller else { return }
         managementWindowController?.showPanel(store: store, controller: controller)
+    }
+
+    @objc private func openSettings() {
+        NSApp.activate(ignoringOtherApps: true)
+        NSApp.sendAction(Selector(("showSettingsWindow:")), to: nil, from: nil)
+    }
+
+    /// Menu rows for the cycle submenu. Empty title = separator. IDs are
+    /// stable strings so the menu survives Settings edits elsewhere.
+    static func cycleMenuEntries() -> [(title: String, id: String)] {
+        var entries: [(title: String, id: String)] = [
+            ("None", CycleMenuID.none.rawValue),
+            ("On Unlock", CycleMenuID.onUnlock.rawValue),
+            ("", ""),
+        ]
+        for preset in CyclePreset.allCases {
+            let id: String
+            switch preset {
+            case .halfHour: id = CycleMenuID.halfHour.rawValue
+            case .oneHour: id = CycleMenuID.oneHour.rawValue
+            case .fiveHours: id = CycleMenuID.fiveHours.rawValue
+            }
+            entries.append((preset.title, id))
+        }
+        entries.append(("Daily", CycleMenuID.daily.rawValue))
+        entries.append(("", ""))
+        entries.append(("Custom…", CycleMenuID.custom.rawValue))
+        return entries
     }
 
     @objc private func fitSelected(_ sender: NSMenuItem) {
@@ -132,6 +213,122 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         let newValue = !SettingsManager.shared.openOnStartup
         SettingsManager.shared.openOnStartup = newValue
         sender.state = newValue ? .on : .off
+    }
+
+    private enum CycleMenuID: String {
+        case none, onUnlock, halfHour, oneHour, fiveHours, daily, custom
+    }
+
+    @objc private func toggleSyncWallpaper(_ sender: NSMenuItem) {
+        let newValue = !SettingsManager.shared.syncSystemWallpaper
+        controller?.setSyncEnabled(newValue)
+        sender.state = newValue ? .on : .off
+    }
+
+    @objc private func cycleSelected(_ sender: NSMenuItem) {
+        guard let raw = sender.representedObject as? String,
+              let id = CycleMenuID(rawValue: raw) else { return }
+        switch id {
+        case .none:
+            controller?.setCycleMode(.none)
+        case .onUnlock:
+            controller?.setCycleMode(.onUnlock)
+        case .halfHour:
+            SettingsManager.shared.applyCyclePreset(.halfHour)
+            controller?.setCycleMode(.interval)
+        case .oneHour:
+            SettingsManager.shared.applyCyclePreset(.oneHour)
+            controller?.setCycleMode(.interval)
+        case .fiveHours:
+            SettingsManager.shared.applyCyclePreset(.fiveHours)
+            controller?.setCycleMode(.interval)
+        case .daily:
+            controller?.setCycleMode(.daily)
+        case .custom:
+            openSettings()
+            return
+        }
+        refreshCycleMenu()
+    }
+
+    @objc private func useHazelAsScreensaver(_ sender: NSMenuItem) {
+        Task {
+            do {
+                try await ScreensaverSelectService.shared.activateForScreensaverAndLockscreen()
+                await MainActor.run { self.refreshCycleMenu() }
+            } catch {
+                await MainActor.run {
+                    let alert = NSAlert(error: error)
+                    alert.messageText = "Could not set Hazel as screensaver"
+                    alert.runModal()
+                }
+            }
+        }
+    }
+
+    @objc private func toggleVideoLockscreen(_ sender: NSMenuItem) {
+        Task {
+            do {
+                let service = HazelLockScreenService.shared
+                if service.isApplied {
+                    try await service.removeLockscreen()
+                } else {
+                    guard let item = store?.activeWallpaper,
+                          let url = store?.validatedURL(item.url) else {
+                        throw HazelLockScreenService.LockScreenError.noActiveVideo
+                    }
+                    try await service.applyLockscreen(video: url, wallpaperID: item.id, title: item.title)
+                }
+                service.refresh()
+                await MainActor.run { self.refreshCycleMenu() }
+            } catch {
+                await MainActor.run {
+                    let alert = NSAlert(error: error)
+                    alert.messageText = "Could not change video lockscreen"
+                    alert.runModal()
+                }
+            }
+        }
+    }
+
+    private func refreshCycleMenu() {
+        guard let menu = statusItem?.menu,
+              let cycleItem = menu.item(withTitle: "Cycle Wallpaper"),
+              let submenu = cycleItem.submenu else { return }
+        for item in submenu.items {
+            guard let raw = item.representedObject as? String,
+                  let id = CycleMenuID(rawValue: raw) else { continue }
+            let mode = SettingsManager.shared.cycleMode
+            let minutes = SettingsManager.shared.cycleIntervalMinutes
+            switch id {
+            case .none:
+                item.state = mode == .none ? .on : .off
+            case .onUnlock:
+                item.state = mode == .onUnlock ? .on : .off
+            case .halfHour:
+                item.state = (mode == .interval && minutes == CyclePreset.halfHour.minutes) ? .on : .off
+            case .oneHour:
+                item.state = (mode == .interval && minutes == CyclePreset.oneHour.minutes) ? .on : .off
+            case .fiveHours:
+                item.state = (mode == .interval && minutes == CyclePreset.fiveHours.minutes) ? .on : .off
+            case .daily:
+                item.state = mode == .daily ? .on : .off
+                item.title = String(format: "Daily %02d:%02d", SettingsManager.shared.cycleDailyHour, SettingsManager.shared.cycleDailyMinute)
+            case .custom:
+                item.state = (mode == .interval && CyclePreset.matching(minutes: minutes) == nil) ? .on : .off
+            }
+        }
+        if let syncItem = menu.item(withTitle: "Sync system wallpaper") {
+            syncItem.state = SettingsManager.shared.syncSystemWallpaper ? .on : .off
+        }
+        ScreensaverSelectService.shared.refresh()
+        if let useItem = menu.item(withTitle: "Use Hazel for screensaver and lockscreen") {
+            useItem.state = ScreensaverSelectService.shared.isSelected ? .on : .off
+        }
+        HazelLockScreenService.shared.refresh()
+        if let lockItem = menu.item(withTitle: "Use video as lockscreen") {
+            lockItem.state = HazelLockScreenService.shared.isApplied ? .on : .off
+        }
     }
 
     @objc private func quitApp() {

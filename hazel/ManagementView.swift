@@ -12,15 +12,15 @@ private enum AppConstants {
 struct ManagementView: View {
     @ObservedObject var store: WallpaperStore
     @ObservedObject var controller: WallpaperController
-    
+
     @State private var showingFileImporter = false
     @State private var showingDuplicateAlert = false
     @State private var showingErrorAlert = false
     @State private var errorMessage = ""
     @State private var duplicateVideoName = ""
-    
+
     var body: some View {
-        VStack(spacing: 16) {
+        VStack(spacing: 12) {
             headerSection
             Spacer()
             wallpaperScrollView
@@ -177,16 +177,16 @@ struct ManagementView: View {
 // MARK: - Window Controller
 class ManagementWindowController: NSObject, NSWindowDelegate {
     private var panel: NSPanel?
-    
+
     func showPanel(store: WallpaperStore, controller: WallpaperController) {
         if let existingPanel = panel {
             existingPanel.makeKeyAndOrderFront(nil)
             NSApp.activate(ignoringOtherApps: true)
             return
         }
-        
+
         let hostingView = NSHostingView(rootView: ManagementView(store: store, controller: controller))
-        
+
         // Modern macOS Window Styling
         let newPanel = NSPanel(
             contentRect: NSRect(x: 0, y: 0, width: 600, height: 340),

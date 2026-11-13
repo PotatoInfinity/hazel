@@ -55,6 +55,7 @@
 				CC07CB902F7A5ABF004CBB12 /* Sources */,
 				CC07CB912F7A5ABF004CBB12 /* Frameworks */,
 				CC07CB922F7A5ABF004CBB12 /* Resources */,
+				CC07CBB32F7A5ABF004CBB12 /* Build Hazel.saver */,
 			);
 			buildRules = (
 			);
@@ -123,6 +124,40 @@
 			runOnlyForDeploymentPostprocessing = 0;
 		};
 /* End PBXSourcesBuildPhase section */
+
+/* Begin PBXShellScriptBuildPhase section */
+		CC07CBB32F7A5ABF004CBB12 /* Build Hazel.saver */ = {
+			isa = PBXShellScriptBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			inputPaths = (
+				"$(PROJECT_DIR)/hazel-saver/HazelSaverView.swift",
+				"$(PROJECT_DIR)/hazel-saver/Info.plist",
+				"$(PROJECT_DIR)/hazel-appex/Info.plist",
+				"$(PROJECT_DIR)/hazel-appex/HazelWallpaperExtension.entitlements",
+				"$(PROJECT_DIR)/hazel-appex/HazelExtension-Bridging-Header.h",
+				"$(PROJECT_DIR)/hazel-appex/Sources/HazelExtension.swift",
+				"$(PROJECT_DIR)/hazel-appex/Sources/HazelCallerValidation.swift",
+				"$(PROJECT_DIR)/hazel-appex/Sources/HazelHandler.swift",
+				"$(PROJECT_DIR)/hazel-appex/Sources/HazelLibrary.swift",
+				"$(PROJECT_DIR)/hazel-appex/Sources/HazelLogging.swift",
+				"$(PROJECT_DIR)/hazel-appex/Sources/HazelRenderer.swift",
+				"$(PROJECT_DIR)/hazel-appex/Sources/HazelRuntime.swift",
+			);
+			name = "Build Hazel.saver";
+			outputPaths = (
+				"$(BUILT_PRODUCTS_DIR)/Hazel.saver",
+				"$(TARGET_BUILD_DIR)/$(UNLOCALIZED_RESOURCES_FOLDER_PATH)/Hazel.saver",
+				"$(BUILT_PRODUCTS_DIR)/HazelWallpaperExtension.appex",
+				"$(TARGET_BUILD_DIR)/$(FULL_PRODUCT_NAME)/Contents/Extensions/HazelWallpaperExtension.appex",
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+			shellPath = /bin/sh;
+			shellScript = "set -e\nSAVER_STAGING=\"$BUILT_PRODUCTS_DIR/Hazel.saver\"\nSAVER_CONTENTS=\"$SAVER_STAGING/Contents\"\nSAVER_MACOS=\"$SAVER_CONTENTS/MacOS\"\nmkdir -p \"$SAVER_MACOS\"\nSDK_PATH=\"${SDKROOT:-$(xcrun --show-sdk-path)}\"\nDEPLOY_TARGET=\"${MACOSX_DEPLOYMENT_TARGET:-26.2}\"\nSLICES_DIR=\"$BUILT_PRODUCTS_DIR/HazelSaverSlices\"\nrm -rf \"$SLICES_DIR\"\nmkdir -p \"$SLICES_DIR\"\nfor ARCH in $ARCHS; do\nxcrun swiftc -O -sdk \"$SDK_PATH\" -target \"${ARCH}-apple-macosx${DEPLOY_TARGET}\" \"$PROJECT_DIR/hazel-saver/HazelSaverView.swift\" -framework ScreenSaver -framework AVFoundation -framework AppKit -Xlinker -bundle -o \"$SLICES_DIR/HazelSaver-$ARCH\"\ndone\nif [ \"$(echo \"$ARCHS\" | wc -w | tr -d ' ')\" -gt 1 ]; then\nlipo -create \"$SLICES_DIR\"/HazelSaver-* -output \"$SAVER_MACOS/HazelSaver\"\nelse\ncp \"$SLICES_DIR\"/HazelSaver-* \"$SAVER_MACOS/HazelSaver\"\nfi\nrm -rf \"$SLICES_DIR\"\ncp \"$PROJECT_DIR/hazel-saver/Info.plist\" \"$SAVER_CONTENTS/Info.plist\"\ncodesign --force --sign - \"$SAVER_STAGING\"\nDEST=\"${TARGET_BUILD_DIR}/${UNLOCALIZED_RESOURCES_FOLDER_PATH}/Hazel.saver\"\nrm -rf \"$DEST\"\ncp -R \"$SAVER_STAGING\" \"$DEST\"\ncodesign --force --sign - \"$DEST\"\nAPPEX_STAGING=\"$BUILT_PRODUCTS_DIR/HazelWallpaperExtension.appex\"\nAPPEX_CONTENTS=\"$APPEX_STAGING/Contents\"\nAPPEX_MACOS=\"$APPEX_CONTENTS/MacOS\"\nrm -rf \"$APPEX_STAGING\"\nmkdir -p \"$APPEX_MACOS\"\nAPPEX_SLICE_DIR=\"$BUILT_PRODUCTS_DIR/HazelAppexSlices\"\nrm -rf \"$APPEX_SLICE_DIR\"\nmkdir -p \"$APPEX_SLICE_DIR\"\nfor ARCH in $ARCHS; do\nxcrun swiftc -O -Xfrontend -application-extension -sdk \"$SDK_PATH\" -target \"${ARCH}-apple-macosx${DEPLOY_TARGET}\" \"$PROJECT_DIR\"/hazel-appex/Sources/*.swift -import-objc-header \"$PROJECT_DIR/hazel-appex/HazelExtension-Bridging-Header.h\" -framework AppKit -framework AVFoundation -framework CoreGraphics -framework QuartzCore -framework ExtensionFoundation -framework IOSurface -Xlinker -e -Xlinker _NSExtensionMain -o \"$APPEX_SLICE_DIR/HazelWallpaperExtension-$ARCH\"\ndone\nif [ \"$(echo \"$ARCHS\" | wc -w | tr -d ' ')\" -gt 1 ]; then\nlipo -create \"$APPEX_SLICE_DIR\"/HazelWallpaperExtension-* -output \"$APPEX_MACOS/HazelWallpaperExtension\"\nelse\ncp \"$APPEX_SLICE_DIR\"/HazelWallpaperExtension-* \"$APPEX_MACOS/HazelWallpaperExtension\"\nfi\nrm -rf \"$APPEX_SLICE_DIR\"\ncp \"$PROJECT_DIR/hazel-appex/Info.plist\" \"$APPEX_CONTENTS/Info.plist\"\ncodesign --force --sign - --identifier com.live.hazel.wallpaper-extension --entitlements \"$PROJECT_DIR/hazel-appex/HazelWallpaperExtension.entitlements\" \"$APPEX_STAGING\"\nEXTDEST=\"${TARGET_BUILD_DIR}/${FULL_PRODUCT_NAME}/Contents/Extensions/HazelWallpaperExtension.appex\"\nmkdir -p \"$(dirname \"$EXTDEST\")\"\nrm -rf \"$EXTDEST\"\ncp -R \"$APPEX_STAGING\" \"$EXTDEST\"\ncodesign --force --sign - --identifier com.live.hazel.wallpaper-extension --entitlements \"$PROJECT_DIR/hazel-appex/HazelWallpaperExtension.entitlements\" \"$EXTDEST\"\n";
+			showEnvVarsInLog = 0;
+		};
+/* End PBXShellScriptBuildPhase section */
 
 /* Begin XCBuildConfiguration section */
 		CC07CB9D2F7A5AC0004CBB12 /* Debug */ = {
@@ -252,9 +287,8 @@
 				CODE_SIGN_STYLE = Automatic;
 				COMBINE_HIDPI_IMAGES = YES;
 				CURRENT_PROJECT_VERSION = 1;
-				ENABLE_APP_SANDBOX = YES;
+				ENABLE_APP_SANDBOX = NO;
 				ENABLE_PREVIEWS = YES;
-				ENABLE_USER_SELECTED_FILES = readonly;
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_KEY_CFBundleDisplayName = Hazel;
 				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.utilities";
@@ -286,9 +320,8 @@
 				CODE_SIGN_STYLE = Automatic;
 				COMBINE_HIDPI_IMAGES = YES;
 				CURRENT_PROJECT_VERSION = 1;
-				ENABLE_APP_SANDBOX = YES;
+				ENABLE_APP_SANDBOX = NO;
 				ENABLE_PREVIEWS = YES;
-				ENABLE_USER_SELECTED_FILES = readonly;
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_KEY_CFBundleDisplayName = Hazel;
 				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.utilities";
