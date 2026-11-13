@@ -19,6 +19,19 @@ final class ScreensaverSelectService {
     private let stateLock = NSLock()
     private var _isSelected = false
     private var lastReassert: Date?
+    /// Serializes automatic re-selections (each restarts the agent via the
+    /// StoreWriter): concurrent triggers coalesce onto one in-flight reselect
+    /// instead of stacking killalls. Manual makeHazelScreensaver calls bypass
+    /// the slot (user-initiated) but share the pre-stamped cooldown.
+    private final class ReselectSlot {
+        var task: Task<Void, Never>?
+    }
+    private let reselectSlot = ReselectSlot()
+
+    /// Terse transition log for Console.app storm/freeze diagnosis.
+    private func cycleLog(_ message: String) {
+        NSLog("[HazelCycle] %@", message)
+    }
 
     /// Cached: the bundled saver's version never changes within a launch.
     private lazy var cachedBundledVersion: String?? = ScreensaverSelectService.readBundledVersion()
@@ -102,16 +115,56 @@ final class ScreensaverSelectService {
     /// Called on every wallpaper switch/cycle: keep bundle + selection following. Silent.
     /// Re-selection is cooldown-gated so rapid switches cannot restart the agent in a loop.
     func followSwitch() async {
+        if Task.isCancelled { return }
         if !SaverInstallService.shared.isInstalled || !bundleCurrent() {
             try? SaverInstallService.shared.install()
         }
+        if Task.isCancelled { return }
         refresh()
         stateLock.lock()
         let cooledDown = lastReassert.map { Date().timeIntervalSince($0) > Self.reassertCooldown } ?? true
         let shouldReassert = !isSelectedUnsafe && SettingsManager.shared.didAutoManageSaver && cooledDown
         stateLock.unlock()
-        if shouldReassert {
-            try? await makeHazelScreensaver()
+        if !shouldReassert { return }
+        cycleLog("followSwitch reselect requested")
+        await requestReselect(reason: "followSwitch")
+    }
+
+    /// Single choke point for every automatic re-selection. The attempt is
+    /// stamped BEFORE the restart (not after success) so rapid callers back
+    /// off instead of each passing the cooldown check mid-flight (TOCTOU
+    /// double-restart). A running reselect is joined, never duplicated.
+    private func requestReselect(reason: String) async {
+        if Task.isCancelled { return }
+        stateLock.lock()
+        if let running = reselectSlot.task {
+            stateLock.unlock()
+            cycleLog("reselect (\(reason)) coalesced onto in-flight")
+            await running.value
+            return
+        }
+        lastReassert = Date()
+        let created: Task<Void, Never> = Task { [weak self] in
+            guard let self else { return }
+            await self.runReselect(reason: reason)
+        }
+        reselectSlot.task = created
+        stateLock.unlock()
+        await created.value
+        stateLock.lock()
+        // Only the running task clears: creation happens under this lock and
+        // only when nil, so no successor can exist while we run.
+        reselectSlot.task = nil
+        stateLock.unlock()
+    }
+
+    private func runReselect(reason: String) async {
+        guard !Task.isCancelled else { return }
+        do {
+            try await makeHazelScreensaver()
+            cycleLog("reselect (\(reason)) applied")
+        } catch {
+            cycleLog("reselect (\(reason)) failed: \(error.localizedDescription)")
         }
     }
 
@@ -121,15 +174,17 @@ final class ScreensaverSelectService {
     /// unless it already took over once (never fights a manual change).
     /// Silent by design — callers surface nothing; the Settings row shows status.
     func ensureAutomatic() async {
+        if Task.isCancelled { return }
         if !SaverInstallService.shared.isInstalled || !bundleCurrent() {
             try? SaverInstallService.shared.install()
         }
+        if Task.isCancelled { return }
         refresh()
-        if !isSelected && !SettingsManager.shared.didAutoManageSaver {
-            try? await makeHazelScreensaver()
-            if isSelected {
-                SettingsManager.shared.didAutoManageSaver = true
-            }
+        if isSelected || SettingsManager.shared.didAutoManageSaver { return }
+        cycleLog("ensureAutomatic first-run select requested")
+        await requestReselect(reason: "ensureAutomatic")
+        if isSelected {
+            SettingsManager.shared.didAutoManageSaver = true
         }
     }
 }

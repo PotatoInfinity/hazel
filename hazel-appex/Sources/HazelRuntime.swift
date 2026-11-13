@@ -195,19 +195,116 @@ func hazelExtractDestination(fromRequest request: Any?) -> (destSize: CGSize, sc
 
 // MARK: - Snapshot
 
+/// On-disk + in-memory cache of the last good decoded frame. The cold-start
+/// seed path must be infallible: if AVAssetImageGenerator fails (file
+/// mid-copy, decoder not ready), the seed falls back to this cache, then to
+/// a solid color, so acquire never replies with an empty (black) context.
+enum HazelFrameCache {
+    private static let lock = NSLock()
+    private nonisolated(unsafe) static var memory: CGImage?
+
+    private static var diskURL: URL {
+        FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("Documents/.hazel-last-frame.png")
+    }
+
+    static func store(_ image: CGImage) {
+        lock.lock()
+        memory = image
+        lock.unlock()
+        // Best-effort persist; failure just means no cross-launch fallback.
+        let url = diskURL
+        guard let dest = CGImageDestinationCreateWithURL(
+            url as CFURL, "public.png" as CFString, 1, nil) else { return }
+        CGImageDestinationAddImage(dest, image, nil)
+        CGImageDestinationFinalize(dest)
+    }
+
+    static func load() -> CGImage? {
+        lock.lock()
+        let mem = memory
+        lock.unlock()
+        if let mem { return mem }
+        guard let src = CGImageSourceCreateWithURL(diskURL as CFURL, nil),
+              let img = CGImageSourceCreateImageAtIndex(src, 0, nil) else {
+            return nil
+        }
+        lock.lock()
+        memory = img
+        lock.unlock()
+        return img
+    }
+
+    /// Small solid-color image guaranteed to construct. Dark slate blue, NOT
+    /// black, so a fallback seed is distinguishable from an empty surface in
+    /// diagnostics and screenshots.
+    static func solidFallback(width: Int = 64, height: Int = 64) -> CGImage? {
+        let w = max(1, width), h = max(1, height)
+        let space = CGColorSpaceCreateDeviceRGB()
+        guard let ctx = CGContext(data: nil, width: w, height: h,
+                                 bitsPerComponent: 8, bytesPerRow: 0, space: space,
+                                 bitmapInfo: CGImageAlphaInfo.premultipliedFirst.rawValue
+                                     | CGBitmapInfo.byteOrder32Little.rawValue) else {
+            return nil
+        }
+        // #12182B-ish slate.
+        ctx.setFillColor(CGColor(red: 0.07, green: 0.09, blue: 0.17, alpha: 1.0))
+        ctx.fill(CGRect(x: 0, y: 0, width: w, height: h))
+        return ctx.makeImage()
+    }
+}
+
 enum HazelSnapshot {
     /// First-frame CGImage of a video, for the cold-start still seed.
     static func firstFrameImage(videoURL: URL) async -> CGImage? {
         let asset = AVURLAsset(url: videoURL)
         let generator = AVAssetImageGenerator(asset: asset)
         generator.appliesPreferredTrackTransform = true
-        return try? await generator.image(at: .zero).image
+        do {
+            let img = try await generator.image(at: .zero).image
+            HazelFrameCache.store(img)
+            return img
+        } catch {
+            hazelLog("  [Seed] AVAssetImageGenerator failed for \(videoURL.lastPathComponent): \(error) — trying frame cache")
+            if let cached = HazelFrameCache.load() {
+                hazelLog("  [Seed] using cached last-good frame")
+                return cached
+            }
+            hazelLog("  [Seed] no cached frame, using solid-color fallback")
+            return HazelFrameCache.solidFallback()
+        }
+    }
+
+    /// Infallible seed: never returns nil. Generator failure falls back to
+    /// the cached last-good frame, then to a solid color, so the caller can
+    /// always composite something before replying to acquire.
+    static func seedImage(videoURL: URL) async -> CGImage {
+        if let img = await firstFrameImage(videoURL: videoURL) { return img }
+        // firstFrameImage already falls back to solid; this is the
+        // belt-and-braces path if even that construction failed.
+        if let cached = HazelFrameCache.load() { return cached }
+        var w = 64, h = 64
+        // Last resort: 1x1 image built by hand (cannot fail the CGContext path).
+        if let solid = HazelFrameCache.solidFallback(width: w, height: h) { return solid }
+        w = 1; h = 1
+        let space = CGColorSpaceCreateDeviceRGB()
+        let ctx = CGContext(data: nil, width: w, height: h, bitsPerComponent: 8,
+                            bytesPerRow: 0, space: space,
+                            bitmapInfo: CGImageAlphaInfo.premultipliedFirst.rawValue
+                                | CGBitmapInfo.byteOrder32Little.rawValue)!
+        ctx.setFillColor(CGColor(red: 0.07, green: 0.09, blue: 0.17, alpha: 1.0))
+        ctx.fill(CGRect(x: 0, y: 0, width: 1, height: 1))
+        return ctx.makeImage()!
     }
 
     /// Create a WallpaperSnapshotXPC containing an IOSurface with a video
     /// frame. Prefers the live renderer's timebase position; falls back to a
     /// random time within the duration so the picker doesn't always see frame 0.
     static func createSnapshotViaRuntime(videoURL: URL?, currentTime: CMTime? = nil) async -> AnyObject? {
+        // NOTE: snapshot decode is fully off the live layer (generator ->
+        // IOSurface -> XPC). It never touches renderer/displayLayer/timebase,
+        // so it cannot blank live playback by construction.
+        hazelLog("  [Snapshot] start video=\(videoURL?.lastPathComponent ?? "nil")")
         guard let videoURL else {
             hazelLog("  [Snapshot] No video file found")
             return nil
@@ -230,6 +327,7 @@ enum HazelSnapshot {
         let image: CGImage
         do {
             image = try await generator.image(at: requestTime).image
+            hazelLog("  [Snapshot] done t=\(requestTime.seconds)s (live layer untouched)")
         } catch {
             hazelLog("  [Snapshot] Failed to get video frame: \(error)")
             return nil

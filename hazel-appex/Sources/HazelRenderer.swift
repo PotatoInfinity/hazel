@@ -54,9 +54,25 @@ final class HazelVideoRenderer: @unchecked Sendable {
     private var lastEnqueuedEnd: CMTime = .zero
 
     static func create(rootLayer: CALayer, videoURL: URL) async throws -> HazelVideoRenderer {
+        // Zero-byte mid-copy stage: fail fast with a distinct log (caller
+        // seeds a gradient and retries on the next library signal) instead of
+        // letting loadTracks throw a generic error on an empty reply path.
+        if let size = HazelLibrary.fileSize(at: videoURL), size == 0 {
+            hazelLog("  [Renderer] create aborted: zero-byte file \(videoURL.lastPathComponent) (mid-copy) — caller holds gradient, retries later")
+            throw CocoaError(.fileReadCorruptFile, userInfo: [
+                NSLocalizedDescriptionKey: "Zero-byte (mid-copy) file \(videoURL.lastPathComponent)",
+            ])
+        }
         let asset = AVURLAsset(url: videoURL)
-        let tracks = try await asset.loadTracks(withMediaType: .video)
+        let tracks: [AVAssetTrack]
+        do {
+            tracks = try await asset.loadTracks(withMediaType: .video)
+        } catch {
+            hazelLog("  [Renderer] create failed: track load threw for \(videoURL.lastPathComponent): \(error) (mid-copy/corrupt?)")
+            throw error
+        }
         guard let track = tracks.first else {
+            hazelLog("  [Renderer] create failed: no video track in \(videoURL.lastPathComponent) (mid-copy/corrupt?)")
             throw CocoaError(.fileReadCorruptFile, userInfo: [
                 NSLocalizedDescriptionKey: "No video track found in \(videoURL.lastPathComponent)",
             ])
@@ -65,11 +81,15 @@ final class HazelVideoRenderer: @unchecked Sendable {
         // agent hosts our context the instant we reply, and a CALayer.contents
         // still reads black cross-process — only IOSurface-backed
         // AVSampleBufferDisplayLayer content composites remotely.
-        let still: CGImage? = await HazelSnapshot.firstFrameImage(videoURL: videoURL)
+        // INFALLIBLE: seedImage falls back to cached last-good frame, then
+        // solid color — never nil, so the layer always has content.
+        hazelLog("  [Renderer] create \(videoURL.lastPathComponent): seeding still")
+        let still: CGImage = await HazelSnapshot.seedImage(videoURL: videoURL)
+        hazelLog("  [Renderer] still seeded \(still.width)x\(still.height)")
         return HazelVideoRenderer(rootLayer: rootLayer, asset: asset, videoTrack: track, stillImage: still)
     }
 
-    private init(rootLayer: CALayer, asset: AVURLAsset, videoTrack: AVAssetTrack, stillImage: CGImage?) {
+    private init(rootLayer: CALayer, asset: AVURLAsset, videoTrack: AVAssetTrack, stillImage: CGImage) {
         self.displayLayer = AVSampleBufferDisplayLayer()
         self.renderer = displayLayer.sampleBufferRenderer
         self.asset = asset
@@ -99,9 +119,12 @@ final class HazelVideoRenderer: @unchecked Sendable {
         CATransaction.begin()
         CATransaction.setDisableActions(true)
         rootLayer.addSublayer(displayLayer)
-        if let stillImage, let stillBuffer = HazelVideoRenderer.makeStillSampleBuffer(from: stillImage) {
+        if let stillBuffer = HazelVideoRenderer.makeStillSampleBuffer(from: stillImage) {
             HazelVideoRenderer.setDisplayImmediately(stillBuffer)
             renderer.enqueue(stillBuffer)
+            hazelLog("  [Renderer] still composited (infallible seed)")
+        } else {
+            hazelLog("  [Renderer] ERROR: makeStillSampleBuffer failed even for infallible seed")
         }
         CATransaction.commit()
         // flush() (not just commit()) pushes the layer tree to the render
@@ -125,8 +148,12 @@ final class HazelVideoRenderer: @unchecked Sendable {
     /// Runs on `queue`. Calls `firstFrameShown` exactly once.
     private func beginPlayback(firstFrameShown: () -> Void) {
         guard isRunning else { firstFrameShown(); return }
+        hazelLog("[Renderer] beginPlayback \(asset.url.lastPathComponent) size=\(HazelLibrary.fileSize(at: asset.url).map(String.init) ?? "nil")")
         guard let reader = try? AVAssetReader(asset: asset) else {
+            hazelLog("[Renderer] ERROR: AVAssetReader create failed for \(asset.url.lastPathComponent) — enqueuing fallback still (holds frame, not black), retrying")
+            enqueueFallbackStill(reason: "reader-create-failed")
             firstFrameShown()
+            schedulePlaybackRetry()
             return
         }
         let output = AVAssetReaderTrackOutput(track: videoTrack, outputSettings: nil)
@@ -142,6 +169,14 @@ final class HazelVideoRenderer: @unchecked Sendable {
             renderer.enqueue(firstSample)
             CATransaction.commit()
             CATransaction.flush()
+            hazelLog("[Renderer] first-frame VIDEO composited for \(asset.url.lastPathComponent) (not still-fallback)")
+        } else {
+            // Decoder not ready yet (cold file, slow disk): NEVER leave the
+            // queue empty (rate 1 + no frames = black). The infallible still
+            // from init is already composited; re-enqueue the fallback so the
+            // surface holds a frame, then retry the read below.
+            hazelLog("[Renderer] first sample nil for \(asset.url.lastPathComponent) — holding FALLBACK STILL (not black), will retry")
+            enqueueFallbackStill(reason: "first-sample-nil")
         }
 
         currentReader = reader
@@ -151,12 +186,44 @@ final class HazelVideoRenderer: @unchecked Sendable {
 
         CMTimebaseSetRate(timebase, rate: 1.0)
         firstFrameShown()
+        hazelLog("[Renderer] playback started rate=1")
         if isPaused {
             holdAfterFirstFrame()
             scheduleDeepPause()
         }
         prepareNextReader()
         feedFromCurrentReader()
+    }
+
+    /// Enqueue an infallible fallback still (cached last-good frame, else
+    /// solid color) with DisplayImmediately so the surface always shows
+    /// *something*. Synchronous on `queue`; caller holds the queue.
+    private func enqueueFallbackStill(reason: String) {
+        // Best-effort synchronous seed: the disk cache read is fast; if even
+        // that fails we build a solid color on the spot.
+        let img: CGImage? = HazelFrameCache.load() ?? HazelFrameCache.solidFallback()
+        guard let img, let buf = Self.makeStillSampleBuffer(from: img) else {
+            hazelLog("[Renderer] ERROR: fallback still construction failed (\(reason))")
+            return
+        }
+        Self.setDisplayImmediately(buf)
+        renderer.enqueue(buf)
+        CATransaction.flush()
+        hazelLog("[Renderer] fallback still enqueued (\(reason))")
+    }
+
+    /// Retry playback setup after a transient decode failure. Bounded: one
+    /// retry after 0.5s; if the file is still unreadable the loop below keeps
+    /// the fallback still on screen and swap/recreate paths will retry on the
+    /// next library signal.
+    private func schedulePlaybackRetry() {
+        queue.asyncAfter(deadline: .now() + 0.5) { [weak self] in
+            guard let self else { return }
+            guard isRunning, currentOutput == nil else { return }
+            hazelLog("[Renderer] retrying playback setup")
+            recreatePlayback(seamlessResume: false)
+            if !isPaused { CMTimebaseSetRate(timebase, rate: 1.0) }
+        }
     }
 
     /// Re-frame the video layer to a new destination geometry. Layer-tree work
@@ -184,20 +251,52 @@ final class HazelVideoRenderer: @unchecked Sendable {
     /// fresh AVSampleBufferDisplayLayer added to an already-hosted context does
     /// not composite, so the layer must be reused.
     func switchVideo(to url: URL) {
+        hazelLog("[Renderer] switchVideo start → \(url.lastPathComponent)")
         queue.async { [self] in
-            guard isRunning else { return }
-            if asset.url == url { return }
+            guard isRunning else {
+                hazelLog("[Renderer] switchVideo ignored: not running")
+                return
+            }
+            if asset.url == url {
+                hazelLog("[Renderer] switchVideo ignored: same URL")
+                return
+            }
             open(url)
         }
     }
 
     /// Open `url` as the current asset and restart from its first frame.
+    /// The track load is validated BEFORE touching the live pipeline, so a
+    /// corrupt/mid-write file never tears down the currently showing video.
     private func open(_ url: URL) {
+        hazelLog("[Renderer] open \(url.lastPathComponent)")
         let newAsset = AVURLAsset(url: url)
-        guard let track = Self.loadFirstVideoTrackBlocking(newAsset) else { return }
+        guard let track = Self.loadFirstVideoTrackBlocking(newAsset) else {
+            hazelLog("[Renderer] switchVideo aborted: no video track in \(url.lastPathComponent) — keeping current video")
+            return
+        }
+        // Guard against a file that exists but has zero readable frames
+        // (mid-copy stage): probe one frame before committing to the swap.
+        guard Self.probeFirstSample(asset: newAsset, track: track) != nil else {
+            hazelLog("[Renderer] switchVideo aborted: no decodable frame in \(url.lastPathComponent) (mid-write?) — keeping current video, will retry on next library signal")
+            return
+        }
         asset = newAsset
         videoTrack = track
         restartWithCurrentAsset()
+    }
+
+    /// Decode (then discard) one frame to prove the asset is readable. Runs
+    /// on `queue`; opens a throwaway reader so the live pipeline is untouched.
+    private static func probeFirstSample(asset: AVURLAsset, track: AVAssetTrack) -> Bool? {
+        guard let reader = try? AVAssetReader(asset: asset) else { return nil }
+        let output = AVAssetReaderTrackOutput(track: track, outputSettings: nil)
+        output.alwaysCopiesSampleData = false
+        reader.add(output)
+        guard reader.startReading() else { return nil }
+        let sample = output.copyNextSampleBuffer()
+        reader.cancelReading()
+        return sample.map { _ in true }
     }
 
     /// Tag a sample buffer so the renderer displays it immediately, replacing
@@ -235,7 +334,11 @@ final class HazelVideoRenderer: @unchecked Sendable {
     /// Stop playback for good. Synchronous with the renderer queue so no
     /// callback is mid-flight when the readers are cancelled. Must not be
     /// called on that queue. Layer-tree removal hops to the main thread.
+    /// NOTE: the last composited frame stays in the torn-down layer; the
+    /// context itself is going away (invalidate grace fired), so no black is
+    /// observable — the host drops the context right after.
     func stop() {
+        hazelLog("[Renderer] stop")
         queue.sync {
             isRunning = false
             cancelDeepPauseTimer()
@@ -261,11 +364,13 @@ final class HazelVideoRenderer: @unchecked Sendable {
                 guard !isPaused else { return }
                 isPaused = true
                 CMTimebaseSetRate(timebase, rate: 0.0)
+                hazelLog("[Policy] paused (rate=0, holding last frame)")
                 scheduleDeepPause()
             } else {
                 guard isPaused else { return }
                 isPaused = false
                 cancelDeepPauseTimer()
+                hazelLog("[Policy] resumed (rate→1)")
                 if currentReader == nil {
                     recreatePlayback(seamlessResume: true)
                 }
@@ -319,7 +424,11 @@ final class HazelVideoRenderer: @unchecked Sendable {
 
     /// Rebuild the pipeline. seamlessResume=true continues from the paused
     /// timebase position (no black flash, no restart-from-0); false resets to 0.
+    /// NEVER removes the displayed image: flush(removingDisplayedImage:false)
+    /// always, so a resume from time 0 (deep pause + lock arriving together)
+    /// holds the last frame instead of flashing black.
     private func recreatePlayback(seamlessResume: Bool = false) {
+        hazelLog("[Renderer] recreatePlayback seamless=\(seamlessResume)")
         renderer.stopRequestingMediaData()
         currentReader?.cancelReading()
         nextReader?.cancelReading()
@@ -328,11 +437,15 @@ final class HazelVideoRenderer: @unchecked Sendable {
 
         let resumeTime = CMTimebaseGetTime(timebase)
         let continuing = seamlessResume && resumeTime.isValid && resumeTime.isNumeric && resumeTime > .zero
-        renderer.flush(removingDisplayedImage: !continuing)
+        // Load-bearing: always false. A resume from time 0 with `true` here
+        // blanks the still and shows black until the first decode lands.
+        renderer.flush(removingDisplayedImage: false)
 
         guard let reader = try? AVAssetReader(asset: asset) else {
+            hazelLog("[Renderer] ERROR: recreate reader-create failed — holding still")
             currentReader = nil
             currentOutput = nil
+            enqueueFallbackStill(reason: "recreate-reader-failed")
             return
         }
         if continuing {
@@ -354,6 +467,7 @@ final class HazelVideoRenderer: @unchecked Sendable {
         if let first = output.copyNextSampleBuffer() {
             Self.setDisplayImmediately(first)
             renderer.enqueue(first)
+            CATransaction.flush()
             let pts = CMSampleBufferGetPresentationTimeStamp(first)
             let dur = CMSampleBufferGetDuration(first)
             if pts.isValid {
@@ -361,6 +475,10 @@ final class HazelVideoRenderer: @unchecked Sendable {
                     ? CMTimeAdd(pts, dur)
                     : CMTimeAdd(pts, CMTime(value: 1, timescale: 60))
             }
+            hazelLog("[Renderer] recreate first-frame composited")
+        } else {
+            hazelLog("[Renderer] recreate first-sample nil — holding still")
+            enqueueFallbackStill(reason: "recreate-first-sample-nil")
         }
 
         prepareNextReader()
@@ -372,11 +490,15 @@ final class HazelVideoRenderer: @unchecked Sendable {
     /// (a flush is a decoder RESET and discards anything enqueued before it
     /// completes), then in the completion resets to 0 and resumes at rate 1.
     /// `removingDisplayedImage:false` holds the last frame — no black.
+    /// Failure paths re-enqueue the fallback still and keep rate 0 + retry
+    /// instead of running an empty queue at rate 1 (which reads as black).
     private func restartWithCurrentAsset() {
         if flushInFlight {
+            hazelLog("[Renderer] restart coalesced (flush in flight)")
             restartPending = true
             return
         }
+        hazelLog("[Renderer] switchVideo restart start")
         flushInFlight = true
         CMTimebaseSetRate(timebase, rate: 0.0)
         renderer.stopRequestingMediaData()
@@ -392,13 +514,17 @@ final class HazelVideoRenderer: @unchecked Sendable {
                 flushInFlight = false
                 if restartPending {
                     restartPending = false
+                    hazelLog("[Renderer] running coalesced restart")
                     restartWithCurrentAsset()
                     return
                 }
                 guard isRunning else { return }
                 guard let reader = try? AVAssetReader(asset: asset) else {
+                    hazelLog("[Renderer] ERROR: switch restart reader-create failed — holding still, retrying")
                     currentReader = nil
                     currentOutput = nil
+                    enqueueFallbackStill(reason: "switch-reader-failed")
+                    scheduleSwitchRetry()
                     return
                 }
                 let output = AVAssetReaderTrackOutput(track: videoTrack, outputSettings: nil)
@@ -415,6 +541,7 @@ final class HazelVideoRenderer: @unchecked Sendable {
                 if let first = output.copyNextSampleBuffer() {
                     Self.setDisplayImmediately(first)
                     renderer.enqueue(first)
+                    CATransaction.flush()
                     let pts = CMSampleBufferGetPresentationTimeStamp(first)
                     let dur = CMSampleBufferGetDuration(first)
                     if pts.isValid {
@@ -422,6 +549,12 @@ final class HazelVideoRenderer: @unchecked Sendable {
                             ? CMTimeAdd(pts, dur)
                             : CMTimeAdd(pts, CMTime(value: 1, timescale: 60))
                     }
+                    hazelLog("[Renderer] switchVideo done: first-frame composited")
+                } else {
+                    hazelLog("[Renderer] ERROR: switch restart first-sample nil — holding still, retrying")
+                    enqueueFallbackStill(reason: "switch-first-sample-nil")
+                    scheduleSwitchRetry()
+                    return
                 }
 
                 CMTimebaseSetRate(timebase, rate: 1.0)
@@ -431,6 +564,18 @@ final class HazelVideoRenderer: @unchecked Sendable {
                 prepareNextReader()
                 feedFromCurrentReader()
             }
+        }
+    }
+
+    /// Bounded retry for a failed switch restart. Re-runs the restart (which
+    /// re-probes the file); the fallback still stays on screen meanwhile.
+    private func scheduleSwitchRetry() {
+        queue.asyncAfter(deadline: .now() + 0.5) { [weak self] in
+            guard let self, isRunning, !flushInFlight else { return }
+            // Only retry if we still have no live frames queued.
+            guard currentOutput == nil || currentReader == nil else { return }
+            hazelLog("[Renderer] retrying switch restart")
+            restartWithCurrentAsset()
         }
     }
 
@@ -466,8 +611,18 @@ final class HazelVideoRenderer: @unchecked Sendable {
             currentOutput = no
             nextReader = nil
             nextOutput = nil
+            hazelLog("[Renderer] loop swap (pre-rolled reader)")
         } else {
-            guard let reader = try? AVAssetReader(asset: asset) else { return }
+            hazelLog("[Renderer] loop swap: no pre-rolled reader — building inline")
+            guard let reader = try? AVAssetReader(asset: asset) else {
+                hazelLog("[Renderer] ERROR: loop-swap reader-create failed — holding still, retrying")
+                enqueueFallbackStill(reason: "loop-swap-reader-failed")
+                queue.asyncAfter(deadline: .now() + 0.5) { [weak self] in
+                    guard let self, isRunning else { return }
+                    swapToNextReader()
+                }
+                return
+            }
             let output = AVAssetReaderTrackOutput(track: videoTrack, outputSettings: nil)
             output.alwaysCopiesSampleData = false
             reader.add(output)

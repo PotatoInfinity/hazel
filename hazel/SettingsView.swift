@@ -51,6 +51,7 @@ struct SettingsView: View {
                 Toggle("Sync system wallpaper", isOn: $syncSystemWallpaper)
                     .onChange(of: syncSystemWallpaper) { _, newValue in
                         controller?.setSyncEnabled(newValue)
+                        NotificationCenter.default.post(name: .hazelCycleSettingsChanged, object: nil)
                     }
                 Text("Keeps the system wallpaper in sync when Hazel quits or the screen locks.")
                     .font(.caption)
@@ -135,6 +136,9 @@ struct SettingsView: View {
         .frame(width: 460, height: 430)
         .padding(8)
         .onAppear(perform: refreshAll)
+        .onReceive(NotificationCenter.default.publisher(for: .hazelCycleSettingsChanged)) { _ in
+            refreshAll()
+        }
         .alert("Settings error", isPresented: $showingError) {
             Button("OK", role: .cancel) { }
         } message: {

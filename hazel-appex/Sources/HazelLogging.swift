@@ -8,7 +8,11 @@
 import Foundation
 import os
 
-private let maxLogSize: UInt64 = 1_024 * 1_024
+private let maxLogSize: UInt64 = 100 * 1_024
+
+/// Lines retained when the log rolls over. Bounded history instead of a full
+/// wipe so post-mortem debugging survives the rollover.
+private let maxLogLinesKept = 200
 
 private let hazelLogURL: URL = {
     let dir = FileManager.default.homeDirectoryForCurrentUser
@@ -30,11 +34,38 @@ func hazelLog(_ message: String) {
         }
         if let current = handle, ((try? current.seekToEnd()) ?? 0) >= maxLogSize {
             try? current.close()
-            try? FileManager.default.removeItem(at: hazelLogURL)
-            FileManager.default.createFile(atPath: hazelLogURL.path, contents: nil)
+            hazelTrimLogFileLocked()
             handle = try? FileHandle(forWritingTo: hazelLogURL)
+            _ = try? handle?.seekToEnd()
         }
         guard let current = handle else { return }
         current.write(data)
     }
+}
+
+/// Trim the log to the last `maxLogLinesKept` lines. Called with
+/// `hazelLogLock` held, after the open handle is closed. Keeps the file
+/// bounded at ~100KB without losing the most recent (most relevant) history.
+private func hazelTrimLogFileLocked() {
+    guard let data = try? Data(contentsOf: hazelLogURL), !data.isEmpty else {
+        FileManager.default.createFile(atPath: hazelLogURL.path, contents: nil)
+        return
+    }
+    let text = String(decoding: data, as: UTF8.self)
+    let lines = text.split(separator: "\n", omittingEmptySubsequences: false)
+    guard lines.count > maxLogLinesKept else {
+        // Under the line budget but over the byte budget (e.g. very long
+        // lines): drop the oldest half by bytes to guarantee shrinkage.
+        let half = data.count / 2
+        let trimmed = data.dropFirst(half)
+        // Re-align to the next newline so we never keep a partial line.
+        if let nl = trimmed.firstIndex(of: UInt8(ascii: "\n")) {
+            try? trimmed[trimmed.index(after: nl)...].write(to: hazelLogURL)
+        } else {
+            try? Data().write(to: hazelLogURL)
+        }
+        return
+    }
+    let kept = lines.suffix(maxLogLinesKept).joined(separator: "\n")
+    try? Data((kept + "\n").utf8).write(to: hazelLogURL)
 }

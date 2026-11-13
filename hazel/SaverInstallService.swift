@@ -65,7 +65,6 @@ final class SaverInstallService {
     enum InstallError: LocalizedError {
         case bundledSaverMissing
         case createDirectoryFailed(String)
-        case removeOldFailed(String)
         case copyFailed(String)
         case verificationFailed(String)
 
@@ -75,8 +74,6 @@ final class SaverInstallService {
                 return "Bundled Hazel.saver not found in the app bundle. Rebuild the app to embed it."
             case .createDirectoryFailed(let detail):
                 return "Could not create Screen Savers folder: \(detail)"
-            case .removeOldFailed(let detail):
-                return "Could not remove old Hazel.saver: \(detail)"
             case .copyFailed(let detail):
                 return "Could not install Hazel.saver: \(detail)"
             case .verificationFailed(let detail):
@@ -101,11 +98,17 @@ final class SaverInstallService {
                     withIntermediateDirectories: true
                 )
             } catch {
-                throw InstallError.createDirectoryFailed(error.localizedDescription)
+                throw InstallError.createDirectoryFailed("\(dest.deletingLastPathComponent().path): \(error.localizedDescription)")
             }
             let staging = dest.deletingLastPathComponent()
                 .appendingPathComponent("\(Self.saverName).installing")
-            try? FileManager.default.removeItem(at: staging)
+            if FileManager.default.fileExists(atPath: staging.path) {
+                do {
+                    try FileManager.default.removeItem(at: staging)
+                } catch {
+                    NSLog("[Hazel] SaverInstallService: staging cleanup failed %@ : %@", staging.path, error.localizedDescription)
+                }
+            }
             do {
                 try FileManager.default.copyItem(at: source, to: staging)
                 if FileManager.default.fileExists(atPath: dest.path) {
@@ -113,12 +116,18 @@ final class SaverInstallService {
                 }
                 try FileManager.default.moveItem(at: staging, to: dest)
             } catch {
-                try? FileManager.default.removeItem(at: staging)
-                throw InstallError.copyFailed(error.localizedDescription)
+                if FileManager.default.fileExists(atPath: staging.path) {
+                    do {
+                        try FileManager.default.removeItem(at: staging)
+                    } catch {
+                        NSLog("[Hazel] SaverInstallService: staging cleanup failed %@ : %@", staging.path, error.localizedDescription)
+                    }
+                }
+                throw InstallError.copyFailed("\(source.path) -> \(dest.path): \(error.localizedDescription)")
             }
             guard infoDictionary(at: dest)?["CFBundleIdentifier"] as? String == Self.saverBundleID,
                   FileManager.default.fileExists(atPath: dest.appendingPathComponent("Contents/MacOS").path) else {
-                throw InstallError.verificationFailed("bundle identifier or executable missing after copy")
+                throw InstallError.verificationFailed("\(dest.path): bundle identifier or executable missing after copy")
             }
         }
     }

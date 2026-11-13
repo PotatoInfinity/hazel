@@ -183,10 +183,19 @@ final class HazelRegistryStore: @unchecked Sendable {
             let pairs = store.surfaces.map { ($0.key, $0.value) }
             store.lock.unlock()
             for (key, surface) in pairs {
-                guard let url = HazelLibrary.shared.videoURL(forChoice: surface.videoID) else { continue }
+                guard let url = HazelLibrary.shared.videoURL(forChoice: surface.videoID) else {
+                    // No usable file for this surface's choice (mid-copy /
+                    // torn scan): keep the current frame/placeholder in place.
+                    // switchVideo's probe would abort anyway; staying put holds
+                    // a frame instead of gaping to black.
+                    hazelLog("  [library] retarget skip \(key) choice=\(surface.videoID ?? "nil") (no usable file — holding current frame)")
+                    continue
+                }
                 if let renderer = surface.renderer {
+                    hazelLog("  [library] retarget switch start \(key) mode=\(surface.mode) activity=\(surface.activity) → \(url.lastPathComponent) (holds last frame during swap, never gaps to black)")
                     renderer.switchVideo(to: url)
                 } else if store.claimRendererCreate(for: key) {
+                    hazelLog("  [library] retarget attach start \(key) mode=\(surface.mode) activity=\(surface.activity) → \(url.lastPathComponent)")
                     let boxedRoot = HazelSendableBox(value: surface.rootLayer)
                     let boxedVideoID = HazelSendableBox(value: surface.videoID)
                     let boxedMode = HazelSendableBox(value: surface.mode)
@@ -269,6 +278,10 @@ enum HazelLifecycle {
 /// contract), the wallpaper plays only on the lock screen and in our own
 /// screensaver slot; the desktop holds a still frame. A suspended surface is
 /// never composited, so it never plays.
+/// INVARIANT: locked/idle ALWAYS play, for either prefs value. Prefs only
+/// decide the desktop; a missing/corrupt prefs file therefore fails toward
+/// playing on locked (never toward black) — see HazelPrefsSource.postCurrent,
+/// which keeps the last-known prefs on any read/decode failure.
 enum HazelPolicy {
     static func shouldPlay(mode: HazelPresentationMode, activity: HazelActivityState,
                            prefs: HazelPrefs) -> Bool {
@@ -309,10 +322,32 @@ final class HazelWallpaperHandler: NSObject, WallpaperExtensionXPCProtocol {
         let registry = HazelSurfaceRegistry.shared
         registry.cancelTeardown(for: key)
 
-        let videoURL = HazelLibrary.shared.videoURL(forChoice: choice)
-        let startPaused = !HazelPolicy.shouldPlay(
-            mode: .default, activity: .active, prefs: HazelPrefsSource.current,
-        )
+        var videoURL = HazelLibrary.shared.videoURL(forChoice: choice)
+        if videoURL == nil {
+            // Lock-time race: the agent can spawn us in the middle of the
+            // app's atomic library.json/video replace. The init-time scan may
+            // have seen the pre-rename state. Re-scan once after a short
+            // delay before giving up — one retry covers the rename window
+            // without stalling the serial queue.
+            hazelLog("  [acquire] no usable video for choice \(choice ?? "nil") entries=\(HazelLibrary.shared.entries.count) display=\(displayID.map(String.init) ?? "nil") — re-scan + retry once")
+            Thread.sleep(forTimeInterval: 0.35)
+            HazelLibrary.shared.scan()
+            videoURL = HazelLibrary.shared.videoURL(forChoice: choice)
+            if videoURL == nil {
+                hazelLog("  [acquire] RETRY miss: still no video for choice \(choice ?? "nil") — gradient fallback (not black)")
+            } else {
+                hazelLog("  [acquire] RETRY hit: \(videoURL!.lastPathComponent) size=\(HazelLibrary.fileSize(at: videoURL!).map(String.init) ?? "nil")")
+            }
+        }
+        if let url = videoURL {
+            hazelLog("  [acquire] video \(url.lastPathComponent) size=\(HazelLibrary.fileSize(at: url).map(String.init) ?? "nil") display=\(displayID.map(String.init) ?? "nil") mode-at-acquire=\(registry.surface(for: key)?.mode ?? .default) (mode arrives via update)")
+        }
+        // Fail toward PLAYING: the mode is unknown at acquire time (it arrives
+        // via a later update). Starting paused risks a lockscreen surface
+        // staying a still forever if that update is lost; starting playing
+        // self-corrects on the desktop via the first update's pause. Locked
+        // and idle ALWAYS play per policy, so playing is the safe default.
+        let startPaused = false
 
         // ---- REUSE: this surface's context already exists ----
         if let existing = registry.surface(for: key) {
@@ -325,32 +360,52 @@ final class HazelWallpaperHandler: NSObject, WallpaperExtensionXPCProtocol {
                 existing.renderer?.resize(to: destSize, scale: scale)
             }
             guard let replyObj = hazelCreateRemoteContextXPC(contextId: existing.contextId) else {
+                hazelLog("  [acquire] ERROR: remote-context XPC build failed")
                 reply(nil, NSError(domain: "HazelWallpaperExtension", code: 3, userInfo: nil)); return
             }
             reply(replyObj, nil)
+            hazelLog("  [acquire] REUSE replied ctx=\(existing.contextId) (already composited, no gap)")
             if isPreview {
                 // Settings preview: still only. Never start the decode loop here.
                 return
             }
-            if existing.videoID == choice, existing.renderer != nil { return }
-            guard let videoURL else { return }
+            if existing.videoID == choice, existing.renderer != nil {
+                hazelLog("  [acquire] REUSE same video, renderer live — no switch")
+                return
+            }
+            guard let videoURL else {
+                hazelLog("  [acquire] REUSE no video staged — keeping current surface")
+                return
+            }
             if let renderer = existing.renderer {
+                hazelLog("  [acquire] REUSE switchVideo start choice=\(choice ?? "nil") url=\(videoURL.lastPathComponent)")
                 renderer.switchVideo(to: videoURL)
                 registry.updateVideoID(choice, for: key)
             } else if registry.claimRendererCreate(for: key) {
                 let boxedRoot = HazelSendableBox(value: existing.rootLayer)
                 let boxedKey = HazelSendableBox(value: key)
                 let boxedChoice = HazelSendableBox(value: choice)
+                let snapMode = existing.mode
+                let snapActivity = existing.activity
                 Task {
                     await HazelWallpaperHandler.attachRenderer(
                         rootLayer: boxedRoot.value, videoURL: videoURL,
                         key: boxedKey.value, choice: boxedChoice.value,
                         startPaused: HazelPolicy.shouldPlay(
-                            mode: registry.surface(for: boxedKey.value)?.mode ?? .default,
-                            activity: .active, prefs: HazelPrefsSource.current,
+                            mode: snapMode,
+                            activity: snapActivity, prefs: HazelPrefsSource.current,
                         ) == false,
                     )
                 }
+            } else {
+                // Renderer build already in flight for this surface: the reply
+                // below hosts whatever is composited NOW. If the layer is
+                // still empty (CREATE task hasn't installed its display layer
+                // yet) the host would show black — seed a gradient first so
+                // the surface never presents empty. The in-flight build
+                // replaces this placeholder when its first frame lands.
+                hazelLog("  [acquire] REUSE renderer build in flight for \(key) — ensuring placeholder before reply (never empty)")
+                Self.ensureGradientPlaceholder(for: key, size: destSize)
             }
             return
         }
@@ -415,9 +470,12 @@ final class HazelWallpaperHandler: NSObject, WallpaperExtensionXPCProtocol {
             let boxedReply = HazelSendableBox(value: replyObj)
             let boxedKey = HazelSendableBox(value: key)
             let boxedChoice = HazelSendableBox(value: choice)
-            // Cold start: reply as soon as the still is seeded so the agent can
-            // host our context without a black gap; the video plays over it.
-            // Switch (re-acquire racing a live surface): covered by REUSE above.
+            // Cold start: reply ONLY after the first frame is composited.
+            // Replying earlier lets the agent host an empty context (black).
+            // The seed is infallible (cached frame → solid color), and start()
+            // resolves after the first enqueue+flush, so the reply below
+            // always follows a composited frame. Switch racing a live surface
+            // is covered by REUSE above.
             Task {
                 do {
                     let renderer = try await HazelVideoRenderer.create(
@@ -430,25 +488,42 @@ final class HazelWallpaperHandler: NSObject, WallpaperExtensionXPCProtocol {
                         surface.placeholder = nil
                     }
                     if startPaused { renderer.setPaused(true) }
-                    reply(boxedReply.value, nil)
                     await renderer.start()
+                    hazelLog("  [acquire] CREATE first-frame composited (video \(videoURL.lastPathComponent)), replying ctx=\(contextId)")
+                    reply(boxedReply.value, nil)
                 } catch {
-                    hazelLog("  [Renderer] Failed to create: \(error)")
+                    // create() throws BEFORE installing any layer (no track /
+                    // mid-copy file). Replying now would host an empty context
+                    // = BLACK on the lockscreen, permanently (no retry was
+                    // scheduled). Seed the gradient fallback so the surface
+                    // never presents empty, then rely on the next
+                    // library-changed signal (retargetToLibrary) to attach.
+                    hazelLog("  [Renderer] CREATE failed for \(videoURL.lastPathComponent): \(error) — gradient fallback, replying (never empty-black)")
+                    Self.ensureGradientPlaceholder(for: key, size: destSize)
                     registry.clearRendererPending(for: key)
                     reply(boxedReply.value, nil)
                 }
             }
         } else {
+            // Defensive: claim failed on a fresh surface (second CREATE racing
+            // the first on the serial queue should be impossible — it would
+            // have hit REUSE — but fail toward a visible gradient, never an
+            // empty reply).
+            hazelLog("  [acquire] CREATE claim contention for \(key) — gradient fallback, replying (never empty-black)")
+            Self.ensureGradientPlaceholder(for: key, size: destSize)
             reply(replyObj, nil)
         }
     }
 
     /// Seed a Settings preview surface with one still frame: no renderer, no
     /// loop, no audio pipeline. Cheap enough to rebuild on every preview open.
+    /// Infallible: falls back to cached frame / solid color so preview never
+    /// shows an empty (black) layer.
     private func seedPreviewStill(into rootLayer: CALayer, size: CGSize, videoURL: URL?,
                                   reply: @escaping @Sendable (Any?, (any Error)?) -> Void,
                                   replyObj: Any) {
         guard let videoURL else {
+            hazelLog("  [acquire] preview: no video — replying with empty surface (placeholder)")
             reply(replyObj, nil)
             return
         }
@@ -456,13 +531,13 @@ final class HazelWallpaperHandler: NSObject, WallpaperExtensionXPCProtocol {
         let boxedReply = HazelSendableBox(value: replyObj)
         let boxedSize = HazelSendableBox(value: size)
         Task {
-            let still = await HazelSnapshot.firstFrameImage(videoURL: videoURL)
+            let still = await HazelSnapshot.seedImage(videoURL: videoURL)
             DispatchQueue.main.async {
-                if let still {
-                    boxedRoot.value.contents = still
-                    boxedRoot.value.contentsGravity = .resizeAspectFill
-                    boxedRoot.value.frame = CGRect(origin: .zero, size: boxedSize.value)
-                }
+                boxedRoot.value.contents = still
+                boxedRoot.value.contentsGravity = .resizeAspectFill
+                boxedRoot.value.frame = CGRect(origin: .zero, size: boxedSize.value)
+                CATransaction.flush()
+                hazelLog("  [acquire] preview still seeded (infallible)")
                 reply(boxedReply.value, nil)
             }
         }
@@ -470,8 +545,12 @@ final class HazelWallpaperHandler: NSObject, WallpaperExtensionXPCProtocol {
 
     /// Attach a renderer to an already-hosted surface (REUSE path with no
     /// renderer yet). Runs off the lifecycle queue.
+    /// On create failure the surface keeps its gradient placeholder (seeded
+    /// by the caller) so the host never composites an empty layer; the next
+    /// library-changed signal retries the attach.
     static func attachRenderer(rootLayer: CALayer, videoURL: URL, key: HazelSurfaceKey,
                                        choice: String?, startPaused: Bool) async {
+        hazelLog("  [acquire] attachRenderer start \(key) choice=\(choice ?? "nil") url=\(videoURL.lastPathComponent) startPaused=\(startPaused)")
         let registry = HazelSurfaceRegistry.shared
         do {
             let renderer = try await HazelVideoRenderer.create(rootLayer: rootLayer, videoURL: videoURL)
@@ -483,10 +562,40 @@ final class HazelWallpaperHandler: NSObject, WallpaperExtensionXPCProtocol {
             }
             if startPaused { renderer.setPaused(true) }
             await renderer.start()
+            hazelLog("  [acquire] attachRenderer done \(key): first-frame composited (video \(videoURL.lastPathComponent))")
         } catch {
-            hazelLog("  [Renderer] attach failed: \(error)")
+            hazelLog("  [Renderer] attach failed for \(videoURL.lastPathComponent): \(error) — placeholder kept, retry on next library signal")
             registry.clearRendererPending(for: key)
+            ensureGradientPlaceholder(for: key, size: nil)
         }
+    }
+
+    /// Guarantee the surface's layer never presents empty: if it currently has
+    /// no video sublayer and no placeholder, install the dark gradient. Used
+    /// on every path that replies without a composited video frame, so a
+    /// reply can never precede seeding. Layer work hops to main (remote
+    /// contexts must be mutated there). No-op when content already exists.
+    static func ensureGradientPlaceholder(for key: HazelSurfaceKey, size: CGSize?) {
+        guard let surface = HazelSurfaceRegistry.shared.surface(for: key) else { return }
+        let work = {
+            let hasContent = !(surface.rootLayer.sublayers?.isEmpty ?? true)
+            if hasContent { return }
+            if surface.placeholder != nil { return }
+            let gradient = CAGradientLayer()
+            gradient.colors = [
+                CGColor(red: 0.15, green: 0.1, blue: 0.25, alpha: 1.0),
+                CGColor(red: 0.05, green: 0.1, blue: 0.2, alpha: 1.0),
+            ]
+            let frameSize = size ?? surface.destSize
+            gradient.frame = CGRect(origin: .zero, size: frameSize)
+            CATransaction.begin(); CATransaction.setDisableActions(true)
+            surface.rootLayer.addSublayer(gradient)
+            CATransaction.commit(); CATransaction.flush()
+            surface.placeholder = gradient
+            hazelLog("  [acquire] gradient placeholder installed for \(key) (never empty-black)")
+        }
+        if Thread.isMainThread { work() }
+        else { DispatchQueue.main.sync(execute: work) }
     }
 
     // MARK: update
@@ -506,14 +615,19 @@ final class HazelWallpaperHandler: NSObject, WallpaperExtensionXPCProtocol {
            let surface = registry.surface(for: key) {
             surface.mode = mode
             surface.activity = activity
-            surface.renderer?.setPaused(!HazelPolicy.shouldPlay(
-                mode: mode, activity: activity, prefs: HazelPrefsSource.current,
-            ))
-            hazelLog("=== UPDATE === \(key) mode: \(mode), activity: \(activity)")
+            let prefs = HazelPrefsSource.current
+            let play = HazelPolicy.shouldPlay(mode: mode, activity: activity, prefs: prefs)
+            surface.renderer?.setPaused(!play)
+            // Distinguish every park reason: suspended/other/mode drive
+            // different fixes, and "PAUSE (hold last frame)" must never be
+            // confused with black (empty layer) in post-mortem logs.
+            hazelLog("=== UPDATE === \(key) mode=\(mode) activity=\(activity) alwaysPauseDesktop=\(prefs.alwaysPauseDesktop) renderer=\(surface.renderer == nil ? "nil" : "live") → \(play ? "PLAY" : "PAUSE (hold last frame, not black)")")
         } else {
             // Unknown or missing surface id: ignore. Fanning out to every
             // surface here caused unrelated desktops to freeze on stray updates.
-            hazelLog("=== UPDATE === unknown surface id, ignoring (mode: \(mode))")
+            // Fallback per-display surfaces (no WallpaperID) land here: they
+            // keep their acquire-time playing state, logged distinctly.
+            hazelLog("=== UPDATE === unknown surface id, ignoring (mode=\(mode) activity=\(activity)); fallback surfaces keep acquire-time state")
         }
         reply(nil)
     }
@@ -546,6 +660,9 @@ final class HazelWallpaperHandler: NSObject, WallpaperExtensionXPCProtocol {
     func snapshot(withId id: Any?, reply: @escaping @Sendable (Any?, (any Error)?) -> Void) {
         // Snapshot the surface the agent asked about (login-screen export shows
         // the wrong video if we answer with an arbitrary surface's frame).
+        // Never touches the live layer: decode goes generator → IOSurface →
+        // XPC, so live playback cannot blank here by construction.
+        hazelLog("=== SNAPSHOT === (live layer untouched)")
         let uuid = hazelExtractWallpaperUUID(fromID: id)
         let key = uuid.flatMap { HazelSurfaceRegistry.shared.key(forWallpaperID: $0) }
         let surface = key.flatMap { HazelSurfaceRegistry.shared.surface(for: $0) }
@@ -566,8 +683,10 @@ final class HazelWallpaperHandler: NSObject, WallpaperExtensionXPCProtocol {
             if let snapshotXPC = await HazelSnapshot.createSnapshotViaRuntime(
                 videoURL: videoURL, currentTime: boxedTime.value,
             ) {
+                hazelLog("=== SNAPSHOT === done (live layer untouched)")
                 reply(snapshotXPC, nil)
             } else {
+                hazelLog("=== SNAPSHOT === failed: no frame (live layer untouched)")
                 reply(nil, nil)
             }
         }

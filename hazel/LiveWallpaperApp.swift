@@ -18,11 +18,16 @@ struct LiveWallpaperApp: App {
     }
 }
 
-class AppDelegate: NSObject, NSApplicationDelegate {
+class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var statusItem: NSStatusItem?
     private var store: WallpaperStore?
     private var controller: WallpaperController?
     private var managementWindowController: ManagementWindowController?
+    /// Periodic drift check: re-reads both selections and re-applies when
+    /// missing. All heavy work stays behind the existing guards (5-min saver
+    /// cooldown, 1-h lockscreen cooldown, no fighting a manual removal), so a
+    /// healthy system costs two plist reads per tick and nothing else.
+    private var watchdogTimer: Timer?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         registerFonts()
@@ -53,6 +58,20 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
         Task {
             await ScreensaverSelectService.shared.ensureAutomatic()
+        }
+
+        watchdogTimer = Timer.scheduledTimer(withTimeInterval: 900, repeats: true) { [weak self] _ in
+            Task { [weak self] in
+                await ScreensaverSelectService.shared.followSwitch()
+                guard let store = self?.store,
+                      let item = store.activeWallpaper,
+                      let url = store.validatedURL(item.url) else { return }
+                await HazelLockScreenService.shared.ensureAutomatic(video: url, wallpaperID: item.id, title: item.title)
+            }
+        }
+        watchdogTimer?.tolerance = 60
+        if let watchdogTimer {
+            RunLoop.main.add(watchdogTimer, forMode: .common)
         }
     }
     
@@ -152,6 +171,15 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         menu.addItem(quitItem)
 
         statusItem?.menu = menu
+        menu.delegate = self
+        cycleMenu.delegate = self
+        fitMenu.delegate = self
+    }
+
+    /// Refreshes all checkmarks/titles on open so the menu never shows stale
+    /// state edited from a Settings window while the menu was closed.
+    func menuWillOpen(_ menu: NSMenu) {
+        refreshCycleMenu()
     }
 
     @objc private func statusItemClicked() {
@@ -196,17 +224,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     @objc private func fitSelected(_ sender: NSMenuItem) {
         guard let fit = sender.representedObject as? WallpaperFit else { return }
         SettingsManager.shared.wallpaperFit = fit
-        
-        if let menu = statusItem?.menu {
-            if let fitItem = menu.item(withTitle: "Wallpaper Fit"),
-               let submenu = fitItem.submenu {
-                for item in submenu.items {
-                    item.state = item.representedObject as? WallpaperFit == fit ? .on : .off
-                }
-            }
-        }
-        
+
+        refreshFitMenu()
+
         controller?.reloadCurrentWallpaper()
+        NotificationCenter.default.post(name: .hazelCycleSettingsChanged, object: nil)
     }
 
     @objc private func toggleStartup(_ sender: NSMenuItem) {
@@ -223,6 +245,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         let newValue = !SettingsManager.shared.syncSystemWallpaper
         controller?.setSyncEnabled(newValue)
         sender.state = newValue ? .on : .off
+        NotificationCenter.default.post(name: .hazelCycleSettingsChanged, object: nil)
     }
 
     @objc private func cycleSelected(_ sender: NSMenuItem) {
@@ -296,10 +319,24 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         if let syncItem = menu.item(withTitle: "Sync system wallpaper") {
             syncItem.state = SettingsManager.shared.syncSystemWallpaper ? .on : .off
         }
+        if let startupItem = menu.item(withTitle: "Open on Startup") {
+            startupItem.state = SettingsManager.shared.openOnStartup ? .on : .off
+        }
+        refreshFitMenu()
         ScreensaverSelectService.shared.refresh()
         HazelLockScreenService.shared.refresh()
         if let useItem = menu.item(withTitle: "Use Hazel for screensaver and lockscreen") {
             useItem.state = (ScreensaverSelectService.shared.isSelected && HazelLockScreenService.shared.isApplied) ? .on : .off
+        }
+    }
+
+    private func refreshFitMenu() {
+        guard let menu = statusItem?.menu,
+              let fitItem = menu.item(withTitle: "Wallpaper Fit"),
+              let submenu = fitItem.submenu else { return }
+        let fit = SettingsManager.shared.wallpaperFit
+        for item in submenu.items {
+            item.state = item.representedObject as? WallpaperFit == fit ? .on : .off
         }
     }
 
@@ -308,6 +345,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationWillTerminate(_ notification: Notification) {
+        watchdogTimer?.invalidate()
+        watchdogTimer = nil
         controller?.clearWallpaper()
     }
 }

@@ -85,20 +85,45 @@ final class HazelLibrary: Sendable {
         return videosDir.appendingPathComponent(entry.id).appendingPathComponent(name)
     }
 
+    /// A staged file counts as usable only if it exists AND has nonzero size.
+    /// A zero-byte file is a mid-copy stage (writer created the path but has
+    /// not flushed bytes yet) — treating it as valid leads CREATE down the
+    /// throw-before-seed path, which used to reply an empty (black) context.
+    static func isUsableVideoFile(at url: URL) -> Bool {
+        let path = url.path
+        guard FileManager.default.fileExists(atPath: path) else { return false }
+        guard let attrs = try? FileManager.default.attributesOfItem(atPath: path),
+              let size = attrs[.size] as? UInt64, size > 0 else {
+            return false
+        }
+        return true
+    }
+
+    /// Nonzero file size, or nil when the file is missing/unreadable.
+    /// Logged at the call site so each failure mode is distinguishable.
+    static func fileSize(at url: URL) -> UInt64? {
+        guard let attrs = try? FileManager.default.attributesOfItem(atPath: url.path),
+              let size = attrs[.size] as? UInt64 else {
+            return nil
+        }
+        return size
+    }
+
     func videoURL(for id: String) -> URL? {
         guard let entry = entry(for: id) else { return nil }
         return videoURL(for: entry)
     }
 
     /// The single video to play: the chosen entry when it exists, else the
-    /// first entry in the library.
+    /// first entry in the library. Files must exist with size>0; a zero-byte
+    /// mid-copy stage is skipped (logged by the caller with fileSize).
     func videoURL(forChoice choice: String?) -> URL? {
         if let choice, let url = videoURL(for: choice) {
-            if FileManager.default.fileExists(atPath: url.path) { return url }
+            if Self.isUsableVideoFile(at: url) { return url }
         }
         for entry in entries {
             if let url = videoURL(for: entry),
-               FileManager.default.fileExists(atPath: url.path) {
+               Self.isUsableVideoFile(at: url) {
                 return url
             }
         }
@@ -106,17 +131,37 @@ final class HazelLibrary: Sendable {
     }
 
     /// Re-read library.json and drop entries whose video file is missing.
+    /// Torn-read safe: a missing file / partial-JSON read keeps the
+    /// last-known entries instead of clobbering to zero (which used to drive
+    /// a lock-time CREATE down the gradient/no-video path while the staged
+    /// file was actually mid-rename). Pruned-to-empty while we previously had
+    /// entries (files mid-copy) also keeps last-known; an explicitly emptied
+    /// library.json (zero wallpapers) is still honored.
     func scan() {
-        var loaded: [HazelWallpaperEntry] = []
-        if let data = try? Data(contentsOf: indexURL),
-           let file = try? JSONDecoder().decode(HazelLibraryFile.self, from: data) {
-            loaded = file.wallpapers
+        guard let data = try? Data(contentsOf: indexURL) else {
+            hazelLog("[Library] scan: index unreadable (torn atomic rewrite?) — keeping \(entries.count) known video(s)")
+            return
+        }
+        guard let file = try? JSONDecoder().decode(HazelLibraryFile.self, from: data) else {
+            hazelLog("[Library] scan: index decode failed (partial JSON?) — keeping \(entries.count) known video(s)")
+            return
+        }
+        if file.wallpapers.isEmpty {
+            let previous = entries
+            lock.withLock { $0 = [] }
+            if !previous.isEmpty { hazelLog("[Library] Scanned: library emptied by app (was \(previous.count))") }
+            else { hazelLog("[Library] Scanned: 0 video(s)") }
+            return
         }
         let fm = FileManager.default
-        let pruned = loaded.filter { entry in
+        let pruned = file.wallpapers.filter { entry in
             guard !entry.id.isEmpty, !entry.id.contains("/") else { return false }
             guard let url = videoURL(for: entry) else { return false }
             return fm.fileExists(atPath: url.path)
+        }
+        if pruned.isEmpty {
+            hazelLog("[Library] scan: \(file.wallpapers.count) entrie(s) but 0 files present (mid-copy?) — keeping \(entries.count) known video(s)")
+            return
         }
         let result = pruned
         lock.withLock { $0 = result }
@@ -167,8 +212,20 @@ enum HazelPrefsSource {
     static let prefsChangedSignal = "com.live.hazel.wallpaper.prefs-changed"
 
     private static var prefsURL: URL {
-        FileManager.default.homeDirectoryForCurrentUser
+        let primary = FileManager.default.homeDirectoryForCurrentUser
             .appendingPathComponent("Documents/hazel-prefs.json")
+        if FileManager.default.fileExists(atPath: primary.path) { return primary }
+        // Same sandbox-home remap probe as HazelLibrary: never write through,
+        // just read the real container path when the primary is absent.
+        if let pw = getpwuid(getuid()), let dir = pw.pointee.pw_dir {
+            let path = String(cString: dir)
+            if !path.isEmpty {
+                let alt = URL(fileURLWithPath: path, isDirectory: true)
+                    .appendingPathComponent("Library/Containers/com.live.hazel.wallpaper-extension/Data/Documents/hazel-prefs.json")
+                if FileManager.default.fileExists(atPath: alt.path) { return alt }
+            }
+        }
+        return primary
     }
 
     private static let lock = OSAllocatedUnfairLock(initialState: HazelPrefs())
@@ -190,15 +247,24 @@ enum HazelPrefsSource {
     }
 
     /// Re-read prefs and re-target every live surface.
+    /// Atomic-replace window: if the file is momentarily missing mid-write
+    /// (or holds partial JSON), the read/decode fails and we KEEP the
+    /// last-known prefs — failing toward playing on locked/idle (which play
+    /// under either prefs value) rather than toward black.
     private static func postCurrent() {
         if let data = try? Data(contentsOf: prefsURL),
            let prefs = try? JSONDecoder().decode(HazelPrefs.self, from: data) {
+            let changed = prefs != lock.withLock({ $0 })
             lock.withLock { $0 = prefs }
             hazelLog("[Prefs] Loaded: alwaysPauseDesktop=\(prefs.alwaysPauseDesktop)")
+            if changed {
+                hazelLog("[Prefs] policy changed — retargeting (locked/idle always PLAY)")
+            }
         } else {
-            // No prefs file yet (app hasn't staged one): keep the default,
-            // which is lock-screen-only playback.
-            hazelLog("[Prefs] No prefs file, keeping alwaysPauseDesktop=\(current.alwaysPauseDesktop)")
+            // No prefs file yet (app hasn't staged one), or a torn read during
+            // an atomic replace: keep the default/last-known, which plays on
+            // locked/idle. Never pause locked for lack of prefs.
+            hazelLog("[Prefs] No prefs file (or torn read), keeping alwaysPauseDesktop=\(current.alwaysPauseDesktop) — locked/idle still PLAY")
         }
         HazelSurfaceRegistry.shared.retargetAll()
     }
