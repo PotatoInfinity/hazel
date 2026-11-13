@@ -174,6 +174,48 @@ struct ManagementView: View {
     }
 }
 
+// MARK: - Settings window (menu bar > Hazel > Settings…)
+
+/// Manual Settings panel mirroring ManagementWindowController. Used instead of
+/// the SwiftUI Settings scene for the menu item because LSUIElement apps have
+/// no key window for showSettingsWindow: to target.
+final class SettingsPanelController: NSObject, NSWindowDelegate {
+    private var panel: NSPanel?
+
+    func show() {
+        if let existingPanel = panel {
+            existingPanel.makeKeyAndOrderFront(nil)
+            NSApp.activate(ignoringOtherApps: true)
+            return
+        }
+
+        let hostingView = NSHostingView(rootView: SettingsView())
+
+        let newPanel = NSPanel(
+            contentRect: NSRect(x: 0, y: 0, width: 500, height: 560),
+            styleMask: [.titled, .closable, .fullSizeContentView, .nonactivatingPanel],
+            backing: .buffered,
+            defer: false
+        )
+
+        newPanel.title = "Hazel Settings"
+        newPanel.isMovableByWindowBackground = true
+        newPanel.contentView = hostingView
+        newPanel.isReleasedWhenClosed = false
+        newPanel.level = .floating
+        newPanel.center()
+        newPanel.delegate = self
+
+        panel = newPanel
+        newPanel.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
+    }
+
+    func windowWillClose(_ notification: Notification) {
+        panel = nil
+    }
+}
+
 // MARK: - Window Controller
 class ManagementWindowController: NSObject, NSWindowDelegate {
     private var panel: NSPanel?

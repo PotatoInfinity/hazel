@@ -118,33 +118,16 @@ struct SettingsView: View {
             }
 
             Section("Screensaver and lockscreen") {
-                HStack {
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text("Screensaver")
-                        Text(isSaverSelected ? "On — plays the current video." : (isSelectingSaver ? "Turning on…" : "Off"))
-                            .font(.caption)
-                            .foregroundColor(.secondary)
+                VStack(alignment: .leading, spacing: 6) {
+                    Text("Video screensaver and lockscreen")
+                    Text(screensaverStatusText)
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                    Button(screensaverButtonTitle) {
+                        Task { await runCombinedActivation() }
                     }
-                    Spacer()
-                    if !isSaverSelected {
-                        Button("Turn on") {
-                            Task { await runSaverActivation() }
-                        }
-                        .disabled(isSelectingSaver)
-                    }
-                }
-                HStack {
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text("Video lockscreen")
-                        Text(lockscreenActive ? "On — plays the current video." : (isApplyingLockscreen ? "Working…" : "Off"))
-                            .font(.caption)
-                            .foregroundColor(.secondary)
-                    }
-                    Spacer()
-                    Button(lockscreenActive ? "Turn off" : "Turn on") {
-                        Task { await runLockscreenToggle() }
-                    }
-                    .disabled(isApplyingLockscreen)
+                    .disabled(isSelectingSaver || isApplyingLockscreen)
+                    .frame(maxWidth: .infinity)
                 }
             }
         }
@@ -197,39 +180,36 @@ struct SettingsView: View {
         cycleChoice = .custom
     }
 
-    private func runSaverActivation() async {
-        isSelectingSaver = true
-        defer { isSelectingSaver = false }
-        do {
-            try await ScreensaverSelectService.shared.activateForScreensaverAndLockscreen()
-            ScreensaverSelectService.shared.refresh()
-            isSaverSelected = ScreensaverSelectService.shared.isSelected
-        } catch {
-            errorMessage = error.localizedDescription
-            showingError = true
+    private var screensaverStatusText: String {
+        if isSelectingSaver || isApplyingLockscreen { return "Working…" }
+        switch (isSaverSelected, lockscreenActive) {
+        case (true, true): return "On — plays the current video."
+        case (true, false): return "Screensaver on, lockscreen off."
+        case (false, true): return "Lockscreen on, screensaver off."
+        case (false, false): return "Off"
         }
     }
 
-    private func runLockscreenToggle() async {
+    private var screensaverButtonTitle: String {
+        (isSaverSelected && lockscreenActive) ? "Re-apply" : "Use Hazel for screensaver and lockscreen"
+    }
+
+    private func runCombinedActivation() async {
+        isSelectingSaver = true
         isApplyingLockscreen = true
-        defer { isApplyingLockscreen = false }
+        defer {
+            isSelectingSaver = false
+            isApplyingLockscreen = false
+        }
         do {
-            if HazelLockScreenService.shared.isApplied {
-                try await HazelLockScreenService.shared.removeLockscreen()
-                SettingsManager.shared.didManualRemoveLockscreen = true
-            } else {
-                guard let store = AppContext.shared.store,
-                      let item = store.activeWallpaper,
-                      let url = store.validatedURL(item.url) else {
-                    throw HazelLockScreenService.LockScreenError.noActiveVideo
-                }
-                try await HazelLockScreenService.shared.applyLockscreen(video: url, wallpaperID: item.id, title: item.title)
-            }
-            HazelLockScreenService.shared.refresh()
-            lockscreenActive = HazelLockScreenService.shared.isApplied
+            try await ScreensaverSelectService.shared.activateForScreensaverAndLockscreen()
         } catch {
             errorMessage = error.localizedDescription
             showingError = true
         }
+        ScreensaverSelectService.shared.refresh()
+        isSaverSelected = ScreensaverSelectService.shared.isSelected
+        HazelLockScreenService.shared.refresh()
+        lockscreenActive = HazelLockScreenService.shared.isApplied
     }
 }

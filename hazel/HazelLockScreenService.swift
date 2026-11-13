@@ -89,9 +89,22 @@ final class HazelLockScreenService {
             .appendingPathComponent("Library/Containers/\(Self.wallpaperExtensionID)/Data/Documents", isDirectory: true)
     }
 
+    /// Stable library id. The store choice and library entry use this FIXED id
+    /// so switching videos never touches the wallpaper store: only the staged
+    /// FILE changes (name carries the video id), and the extension retargets
+    /// live renderers on the library-changed notification. No agent restarts
+    /// per switch — applying happens once, following is free.
+    static let stagedID = "hazel-current"
+
+    /// Staged file for a video: name carries the video id so a switch changes
+    /// the URL (the appex switches readers by URL) while old files are swept.
+    private func stagedFileName(for wallpaperID: UUID) -> String {
+        "wallpaper-\(wallpaperID.uuidString.prefix(8).lowercased()).mov"
+    }
+
     func stagedVideoURL(for wallpaperID: UUID) -> URL {
         containerDocumentsURL
-            .appendingPathComponent("videos/\(wallpaperID.uuidString)/wallpaper.mov")
+            .appendingPathComponent("videos/\(Self.stagedID)/\(stagedFileName(for: wallpaperID))", isDirectory: false)
     }
 
     private struct LibraryEntry: Codable {
@@ -116,24 +129,41 @@ final class HazelLockScreenService {
         return library.wallpapers.first?.id
     }
 
-    /// Copies `video` into the extension container as `videos/<id>/wallpaper.mov`
-    /// (atomically), refreshes `library.json` + `hazel-prefs.json`, and posts the
-    /// Darwin library/prefs notifications. Returns `false` when nothing changed
-    /// (same id already staged with matching size+mtime), so callers can stage on
-    /// every wallpaper switch cheaply. Never touches the wallpaper store.
+    /// The library.json the extension will accept: single entry with the fixed
+    /// staged id and a bare basename filename (the extension prunes any entry
+    /// containing "/" or "..").
+    private func isStagedCurrent(video: URL, wallpaperID: UUID) -> Bool {
+        let dest = stagedVideoURL(for: wallpaperID)
+        guard stagedWallpaperID() == Self.stagedID,
+              fileManager.fileExists(atPath: dest.path),
+              sameFile(dest, video) else { return false }
+        let url = containerDocumentsURL.appendingPathComponent("library.json")
+        guard let data = try? Data(contentsOf: url),
+              let library = try? JSONDecoder().decode(ExtensionLibrary.self, from: data),
+              let entry = library.wallpapers.first,
+              entry.id == Self.stagedID,
+              entry.videoFilename == stagedFileName(for: wallpaperID) else { return false }
+        return true
+    }
+
+    /// Copies `video` into the extension container as
+    /// `videos/hazel-current/wallpaper-<id8>.mov` (atomically), refreshes `library.json` + `hazel-prefs.json`, and posts the
+    /// Darwin library/prefs notifications. Returns `false` when nothing changed,
+    /// so callers can stage on every wallpaper switch cheaply.
+    /// Never touches the wallpaper store.
     ///
     /// NOTE: `videoFilename` is the bare basename — the extension prunes any
     /// entry containing "/" (path traversal guard); a subpath never resolves.
     @discardableResult
     func stage(video: URL, wallpaperID: UUID, title: String) throws -> Bool {
         let dest = stagedVideoURL(for: wallpaperID)
-        if stagedWallpaperID() == wallpaperID.uuidString,
-           fileManager.fileExists(atPath: dest.path),
-           sameFile(dest, video) {
+        if isStagedCurrent(video: video, wallpaperID: wallpaperID) {
             return false
         }
         try fileManager.createDirectory(at: dest.deletingLastPathComponent(), withIntermediateDirectories: true)
-        let tmp = dest.deletingLastPathComponent().appendingPathComponent("wallpaper.mov.download")
+        // Unique temp name: two overlapping stages must never share a path.
+        let tmp = dest.deletingLastPathComponent()
+            .appendingPathComponent("wallpaper.\(UUID().uuidString.prefix(8)).download")
         try? fileManager.removeItem(at: tmp)
         do {
             try fileManager.copyItem(at: video, to: tmp)
@@ -149,10 +179,11 @@ final class HazelLockScreenService {
         } catch {
             throw PaperSaverError.plistWriteError("\(dest.path): stage replace failed: \(error.localizedDescription)")
         }
+        sweepStaleStaged(except: dest)
         let library = ExtensionLibrary(wallpapers: [LibraryEntry(
-            id: wallpaperID.uuidString,
+            id: Self.stagedID,
             title: title,
-            videoFilename: "wallpaper.mov")])
+            videoFilename: dest.lastPathComponent)])
         do {
             let data = try JSONEncoder().encode(library)
             try data.write(to: containerDocumentsURL.appendingPathComponent("library.json"), options: .atomic)
@@ -168,6 +199,31 @@ final class HazelLockScreenService {
         }
         postDarwinNotification(Self.prefsChangedNote)
         return true
+    }
+
+    /// Removes staged files from previous videos (old per-id dirs from the
+    /// earlier layout plus superseded files). Cheap directory listing; the live
+    /// file is never touched.
+    private func sweepStaleStaged(except current: URL) {
+        let videos = containerDocumentsURL.appendingPathComponent("videos", isDirectory: true)
+        guard let entries = try? fileManager.contentsOfDirectory(at: videos, includingPropertiesForKeys: nil) else { return }
+        for entry in entries {
+            var isDir: ObjCBool = false
+            guard fileManager.fileExists(atPath: entry.path, isDirectory: &isDir) else { continue }
+            if isDir.boolValue {
+                if entry.lastPathComponent == "hazel-current" {
+                    let files = (try? fileManager.contentsOfDirectory(at: entry, includingPropertiesForKeys: nil)) ?? []
+                    for file in files where file.lastPathComponent != current.lastPathComponent
+                        && !file.pathExtension.lowercased().hasPrefix("downloa")
+                        && file.pathExtension.lowercased() != "download" {
+                        try? fileManager.removeItem(at: file)
+                    }
+                } else {
+                    // Legacy per-id directory from the old staging layout.
+                    try? fileManager.removeItem(at: entry)
+                }
+            }
+        }
     }
 
     private func sameFile(_ a: URL, _ b: URL) -> Bool {
@@ -363,9 +419,7 @@ final class HazelLockScreenService {
     private let automaticLock = NSLock()
 
     func ensureAutomatic(video: URL, wallpaperID: UUID, title: String) async {
-        HazelLockScreenService.debugLog("ensureAutomatic enter isApplied=\(isApplied)")
         refresh()
-        HazelLockScreenService.debugLog("ensureAutomatic refreshed isApplied=\(isApplied) didAuto=\(SettingsManager.shared.didAutoApplyLockscreen) manualRm=\(SettingsManager.shared.didManualRemoveLockscreen)")
         if isApplied { return }
         if SettingsManager.shared.didAutoApplyLockscreen {
             // Heal path only: never revert an explicit manual removal, and at
@@ -375,54 +429,29 @@ final class HazelLockScreenService {
                Date().timeIntervalSince(last) < 3600 { return }
         }
         automaticLock.lock()
-        HazelLockScreenService.debugLog("ensureAutomatic: lock acquired")
         if let running = automaticSlot.task {
             automaticLock.unlock()
-            HazelLockScreenService.debugLog("ensureAutomatic: joining in-flight task")
             await running.value
             return
         }
         let created = Task { await self.runAutomaticOnce(video: video, wallpaperID: wallpaperID, title: title) }
         automaticSlot.task = created
         automaticLock.unlock()
-        HazelLockScreenService.debugLog("ensureAutomatic: task created, awaiting")
         await created.value
-        HazelLockScreenService.debugLog("ensureAutomatic: task done")
         automaticLock.lock()
         if automaticSlot.task?.hashValue == created.hashValue { automaticSlot.task = nil }
         automaticLock.unlock()
     }
 
-    // MARK: - Debug (temporary)
-
-    static func debugLog(_ message: String) {
-        let line = "[\(Date())] \(message)\n"
-        if let data = line.data(using: .utf8) {
-            let url = URL(fileURLWithPath: "/tmp/hazel-debug.log")
-            if FileManager.default.fileExists(atPath: url.path),
-               let handle = try? FileHandle(forWritingTo: url) {
-                try? handle.seekToEnd()
-                try? handle.write(contentsOf: data)
-                try? handle.close()
-            } else {
-                try? data.write(to: url)
-            }
-        }
-    }
-
     private func runAutomaticOnce(video: URL, wallpaperID: UUID, title: String) async {
-        HazelLockScreenService.debugLog("runAutomaticOnce enter")
         do {
             guard (try? stage(video: video, wallpaperID: wallpaperID, title: title)) != nil else {
-                HazelLockScreenService.debugLog("runAutomaticOnce: stage threw, abort")
                 return
             }
         } catch {
-            HazelLockScreenService.debugLog("runAutomaticOnce: stage failed: \(error.localizedDescription)")
             return
         }
         refresh()
-        HazelLockScreenService.debugLog("runAutomaticOnce: staged, isApplied=\(isApplied)")
         guard !isApplied else { return }
         // First run, or heal path (ensureAutomatic already enforced the
         // manual-removal opt-out and the hourly attempt cap). Stamp the attempt
@@ -430,15 +459,12 @@ final class HazelLockScreenService {
         SettingsManager.shared.lastLockscreenAutoAttempt = Date()
         do {
             let outcome = try await applyLockscreen(video: video, wallpaperID: wallpaperID, title: title)
-            HazelLockScreenService.debugLog("runAutomaticOnce: apply returned \(outcome)")
         } catch {
-            HazelLockScreenService.debugLog("runAutomaticOnce: auto-apply failed: \(error.localizedDescription)")
         }
         refresh()
         if isApplied {
             SettingsManager.shared.didAutoApplyLockscreen = true
         }
-        HazelLockScreenService.debugLog("runAutomaticOnce: done isApplied=\(isApplied)")
     }
 
     /// Restores the newest pre-apply backup (backup-first: snapshots the

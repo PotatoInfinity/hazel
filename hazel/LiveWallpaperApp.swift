@@ -92,7 +92,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         openItem.target = self
         menu.addItem(openItem)
 
-        let settingsItem = NSMenuItem(title: "Settings…", action: #selector(openSettings), keyEquivalent: ",")
+        // Titled "Hazel Settings" (not "Settings…"): macOS decorates an item
+        // named exactly "Settings…" with a gear icon we don't want.
+        let settingsItem = NSMenuItem(title: "Hazel Settings", action: #selector(openSettings), keyEquivalent: ",")
         settingsItem.target = self
         menu.addItem(settingsItem)
 
@@ -126,10 +128,6 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         let useSaverItem = NSMenuItem(title: "Use Hazel for screensaver and lockscreen", action: #selector(useHazelAsScreensaver(_:)), keyEquivalent: "")
         useSaverItem.target = self
         menu.addItem(useSaverItem)
-
-        let lockscreenItem = NSMenuItem(title: "Use video as lockscreen", action: #selector(toggleVideoLockscreen(_:)), keyEquivalent: "")
-        lockscreenItem.target = self
-        menu.addItem(lockscreenItem)
 
         let cycleMenu = NSMenu()
         for (title, id) in AppDelegate.cycleMenuEntries() {
@@ -167,8 +165,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     @objc private func openSettings() {
         NSApp.activate(ignoringOtherApps: true)
-        NSApp.sendAction(Selector(("showSettingsWindow:")), to: nil, from: nil)
+        settingsPanelController.show()
     }
+
+    private lazy var settingsPanelController = SettingsPanelController()
 
     /// Menu rows for the cycle submenu. Empty title = separator. IDs are
     /// stable strings so the menu survives Settings edits elsewhere.
@@ -266,31 +266,6 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    @objc private func toggleVideoLockscreen(_ sender: NSMenuItem) {
-        Task {
-            do {
-                let service = HazelLockScreenService.shared
-                if service.isApplied {
-                    try await service.removeLockscreen()
-                } else {
-                    guard let item = store?.activeWallpaper,
-                          let url = store?.validatedURL(item.url) else {
-                        throw HazelLockScreenService.LockScreenError.noActiveVideo
-                    }
-                    try await service.applyLockscreen(video: url, wallpaperID: item.id, title: item.title)
-                }
-                service.refresh()
-                await MainActor.run { self.refreshCycleMenu() }
-            } catch {
-                await MainActor.run {
-                    let alert = NSAlert(error: error)
-                    alert.messageText = "Could not change video lockscreen"
-                    alert.runModal()
-                }
-            }
-        }
-    }
-
     private func refreshCycleMenu() {
         guard let menu = statusItem?.menu,
               let cycleItem = menu.item(withTitle: "Cycle Wallpaper"),
@@ -322,12 +297,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             syncItem.state = SettingsManager.shared.syncSystemWallpaper ? .on : .off
         }
         ScreensaverSelectService.shared.refresh()
-        if let useItem = menu.item(withTitle: "Use Hazel for screensaver and lockscreen") {
-            useItem.state = ScreensaverSelectService.shared.isSelected ? .on : .off
-        }
         HazelLockScreenService.shared.refresh()
-        if let lockItem = menu.item(withTitle: "Use video as lockscreen") {
-            lockItem.state = HazelLockScreenService.shared.isApplied ? .on : .off
+        if let useItem = menu.item(withTitle: "Use Hazel for screensaver and lockscreen") {
+            useItem.state = (ScreensaverSelectService.shared.isSelected && HazelLockScreenService.shared.isApplied) ? .on : .off
         }
     }
 

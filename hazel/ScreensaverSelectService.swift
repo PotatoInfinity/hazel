@@ -72,7 +72,8 @@ final class ScreensaverSelectService {
         stateLock.unlock()
     }
 
-    /// Full activation: bundle in place + selected + lockscreen still follows.
+    /// Full activation in one tap: bundle in place, screensaver selected, and
+    /// video lockscreen applied (needs the active wallpaper).
     func activateForScreensaverAndLockscreen() async throws {
         if !SaverInstallService.shared.isInstalled || !bundleCurrent() {
             try SaverInstallService.shared.install()
@@ -84,6 +85,17 @@ final class ScreensaverSelectService {
         try await makeHazelScreensaver()
         if isSelected {
             SettingsManager.shared.didAutoManageSaver = true
+        }
+        guard let item = AppContext.shared.store?.activeWallpaper,
+              let url = AppContext.shared.store?.validatedURL(item.url) else {
+            throw HazelLockScreenService.LockScreenError.noActiveVideo
+        }
+        try await HazelLockScreenService.shared.applyLockscreen(video: url, wallpaperID: item.id, title: item.title)
+        HazelLockScreenService.shared.refresh()
+        guard HazelLockScreenService.shared.isApplied else {
+            throw HazelLockScreenService.LockScreenError.processFailed(
+                executable: "WallpaperAgent", status: -1,
+                output: "Video lockscreen did not verify after apply.")
         }
     }
 

@@ -165,7 +165,7 @@ class WallpaperStore: ObservableObject {
             let encoder = JSONEncoder()
             encoder.outputFormatting = .prettyPrinted
             let data = try encoder.encode(wallpapers)
-            try data.write(to: storageURL)
+            try data.write(to: storageURL, options: .atomic)
         } catch {
             print("Failed to save wallpapers: \(error)")
         }
