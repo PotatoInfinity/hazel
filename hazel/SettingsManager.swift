@@ -97,6 +97,20 @@ class SettingsManager {
             UserDefaults.standard.set(newValue.rawValue, forKey: "wallpaperFit")
         }
     }
+
+    var menuBarIcon: MenuBarIcon {
+        get {
+            if let rawValue = UserDefaults.standard.string(forKey: "menuBarIcon"),
+               let icon = MenuBarIcon(rawValue: rawValue) {
+                return icon
+            }
+            return .hazelLight
+        }
+        set {
+            UserDefaults.standard.set(newValue.rawValue, forKey: "menuBarIcon")
+            NotificationCenter.default.post(name: .hazelMenuBarIconChanged, object: nil)
+        }
+    }
     
     var openOnStartup: Bool {
         get {
@@ -266,19 +280,35 @@ class SettingsManager {
     }
     
     private init() {
-        updateLoginItem(enabled: openOnStartup)
+        // No work here: SMAppService hits launchd over XPC and must not run
+        // anywhere near the first-frame decode. The UserDefaults value is
+        // already authoritative; daemon convergence happens in
+        // syncLoginItemAfterWarmup (first frame + quiet, via the app's
+        // deferred launch block) and on every explicit toggle below.
+    }
+
+    /// Converges the launchd registration with the stored preference. Called
+    /// once from the app's deferred launch block (after the first frame, off
+    /// the critical path), never during init.
+    func syncLoginItemAfterWarmup() {
+        updateLoginItem(enabled: UserDefaults.standard.bool(forKey: "openOnStartup"))
     }
     
     private func updateLoginItem(enabled: Bool) {
-        if #available(macOS 13.0, *) {
-            do {
-                if enabled {
-                    try SMAppService.mainApp.register()
-                } else {
-                    try SMAppService.mainApp.unregister()
+        // Fire-and-forget off the caller (often main during launch):
+        // registration is idempotent, callers never depend on completion.
+        // Background so launchd XPC never contends display decode.
+        DispatchQueue.global(qos: .background).async {
+            if #available(macOS 13.0, *) {
+                do {
+                    if enabled {
+                        try SMAppService.mainApp.register()
+                    } else {
+                        try SMAppService.mainApp.unregister()
+                    }
+                } catch {
+                    print("Failed to update login item: \(error)")
                 }
-            } catch {
-                print("Failed to update login item: \(error)")
             }
         }
     }

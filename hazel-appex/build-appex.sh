@@ -16,7 +16,7 @@ set -e
 HERE="$(cd "$(dirname "$0")" && pwd)"
 STAGE="$HERE/build"
 ARCHS="${ARCHS:-arm64}"
-DEPLOY_TARGET="${MACOSX_DEPLOYMENT_TARGET:-26.2}"
+DEPLOY_TARGET="${MACOSX_DEPLOYMENT_TARGET:-26.0}"
 SDK_PATH="${SDK_PATH:-$(xcrun --show-sdk-path)}"
 APPEX="$STAGE/HazelWallpaperExtension.appex"
 CONTENTS="$APPEX/Contents"

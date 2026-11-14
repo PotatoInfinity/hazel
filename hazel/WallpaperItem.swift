@@ -2,7 +2,7 @@ import Foundation
 
 struct WallpaperItem: Codable, Identifiable, Equatable {
     let id: UUID
-    let url: URL
+    var url: URL
     let title: String
     var thumbnailPath: String?
     var isLooping: Bool

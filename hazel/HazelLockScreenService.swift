@@ -56,32 +56,116 @@ final class HazelLockScreenService {
     private let storeFile = StoreFile()
 
     /// Serializes every store-write + agent-restart sequence (manual apply,
-    /// automatic apply, remove) so switch storms and watchdog heals can never
-    /// interleave writes and killalls (H3). Async handoff: the lock is only
-    /// held to check/transfer ownership, never across awaits.
+    /// automatic apply, remove, restore) so switch storms and watchdog heals
+    /// can never interleave writes and killalls (H3). Async handoff: the lock
+    /// is only held to check/transfer ownership, never across awaits.
+    /// Cancellable wait: a superseded switch waiting here aborts (throws
+    /// CancellationError) instead of running a stale apply behind the newer
+    /// video. Cancelled waiters are removed from the queue so they never
+    /// block or leak.
+    private final class ApplyGateWaiter {
+        var continuation: CheckedContinuation<Void, Error>?
+        var resumed = false
+    }
     private let applyGateLock = NSLock()
     private var applyGateActive = false
-    private var applyGateWaiters: [CheckedContinuation<Void, Never>] = []
+    private var applyGateWaiters: [ApplyGateWaiter] = []
 
-    private func acquireApplyGate() async {
+    private func acquireApplyGate() async throws {
+        if Task.isCancelled { throw CancellationError() }
+        let waiter = ApplyGateWaiter()
+        try await withTaskCancellationHandler(operation: {
+            try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+                var immediate: Result<Void, Error>? = nil
+                self.applyGateLock.withLock {
+                    if Task.isCancelled {
+                        immediate = .failure(CancellationError())
+                    } else if !self.applyGateActive {
+                        self.applyGateActive = true
+                        immediate = .success(())
+                    } else {
+                        waiter.continuation = continuation
+                        self.applyGateWaiters.append(waiter)
+                    }
+                }
+                if let immediate {
+                    switch immediate {
+                    case .success: continuation.resume()
+                    case .failure(let error): continuation.resume(throwing: error)
+                    }
+                }
+            }
+        }, onCancel: {
+            var toResume: CheckedContinuation<Void, Error>? = nil
+            self.applyGateLock.withLock {
+                if waiter.resumed { return }
+                guard waiter.continuation != nil else { return }
+                if let index = self.applyGateWaiters.firstIndex(where: { $0 === waiter }) {
+                    self.applyGateWaiters.remove(at: index)
+                    waiter.resumed = true
+                    toResume = waiter.continuation
+                    waiter.continuation = nil
+                }
+            }
+            toResume?.resume(throwing: CancellationError())
+        })
+        // A cancel that lands after handoff (release already transferred
+        // ownership) must not run a stale apply behind the newer video.
+        if Task.isCancelled {
+            releaseApplyGate()
+            throw CancellationError()
+        }
+    }
+
+    private func releaseApplyGate() {
+        let next: ApplyGateWaiter? = applyGateLock.withLock {
+            if applyGateWaiters.isEmpty {
+                applyGateActive = false
+                return nil
+            }
+            // Ownership transfers to the waiter; stays active.
+            let waiter = applyGateWaiters.removeFirst()
+            waiter.resumed = true
+            return waiter
+        }
+        if let continuation = next?.continuation {
+            next?.continuation = nil
+            continuation.resume()
+        }
+    }
+
+    /// Serializes every extension-container mutation (video copy, stale sweep,
+    /// library.json + prefs rewrite + Darwin notifies) so concurrent stages
+    /// (followSwitch vs apply vs automatic) can never interleave copies and
+    /// sweeps (one stage deleting another's file) or race library.json.
+    /// FIFO, never-drop: waits ignore cancellation so every video switch
+    /// stages exactly once in arrival order. Separate from the apply gate
+    /// (which serializes store writes + killalls): stages never block on long
+    /// agent restarts, and store writes never block on file copies beyond the
+    /// brief stage critical section.
+    private let stageGateLock = NSLock()
+    private var stageGateActive = false
+    private var stageGateWaiters: [CheckedContinuation<Void, Never>] = []
+
+    private func acquireStageGate() async {
         while true {
-            let shouldWait: Bool = applyGateLock.withLock {
-                if !applyGateActive {
-                    applyGateActive = true
+            let shouldWait: Bool = stageGateLock.withLock {
+                if !stageGateActive {
+                    stageGateActive = true
                     return false
                 }
                 return true
             }
             if !shouldWait { return }
             await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
-                let takeNow: Bool = applyGateLock.withLock {
+                let takeNow: Bool = stageGateLock.withLock {
                     // Re-check under the lock: the gate may have been released
                     // between the check above and now.
-                    if !applyGateActive {
-                        applyGateActive = true
+                    if !stageGateActive {
+                        stageGateActive = true
                         return true
                     }
-                    applyGateWaiters.append(continuation)
+                    stageGateWaiters.append(continuation)
                     return false
                 }
                 if takeNow { continuation.resume() }
@@ -89,14 +173,14 @@ final class HazelLockScreenService {
         }
     }
 
-    private func releaseApplyGate() {
-        let next: CheckedContinuation<Void, Never>? = applyGateLock.withLock {
-            if applyGateWaiters.isEmpty {
-                applyGateActive = false
+    private func releaseStageGate() {
+        let next: CheckedContinuation<Void, Never>? = stageGateLock.withLock {
+            if stageGateWaiters.isEmpty {
+                stageGateActive = false
                 return nil
             }
             // Ownership transfers to the waiter; stays active.
-            return applyGateWaiters.removeFirst()
+            return stageGateWaiters.removeFirst()
         }
         next?.resume()
     }
@@ -237,11 +321,18 @@ final class HazelLockScreenService {
     /// Darwin library/prefs notifications. Returns `false` when nothing changed,
     /// so callers can stage on every wallpaper switch cheaply.
     /// Never touches the wallpaper store.
+    /// Serialized through the stage gate: the check, copy, sweep and
+    /// library rewrite are one atomic critical section, so concurrent stages
+    /// can never interleave copies/sweeps or race library.json. FIFO and
+    /// never-drop (waits ignore cancellation) so every switch stages exactly
+    /// once in arrival order.
     ///
     /// NOTE: `videoFilename` is the bare basename — the extension prunes any
     /// entry containing "/" (path traversal guard); a subpath never resolves.
     @discardableResult
-    func stage(video: URL, wallpaperID: UUID, title: String) throws -> Bool {
+    func stage(video: URL, wallpaperID: UUID, title: String) async throws -> Bool {
+        await acquireStageGate()
+        defer { releaseStageGate() }
         let dest = stagedVideoURL(for: wallpaperID)
         if isStagedCurrent(video: video, wallpaperID: wallpaperID) {
             // Bytes unchanged, but library.json + notifications are the
@@ -469,7 +560,7 @@ final class HazelLockScreenService {
     /// writes and killalls never interleave.
     @discardableResult
     func applyLockscreen(video: URL, wallpaperID: UUID, title: String) async throws -> WriteOutcome {
-        await acquireApplyGate()
+        try await acquireApplyGate()
         defer { releaseApplyGate() }
         return try await performApplyLockscreen(video: video, wallpaperID: wallpaperID, title: title)
     }
@@ -477,7 +568,7 @@ final class HazelLockScreenService {
     private func performApplyLockscreen(video: URL, wallpaperID: UUID, title: String) async throws -> WriteOutcome {
         lsLog("apply start id=\(wallpaperID.uuidString.prefix(8)) title=\(title)")
         try await ensureRegistered()
-        try stage(video: video, wallpaperID: wallpaperID, title: title)
+        try await stage(video: video, wallpaperID: wallpaperID, title: title)
         // Fast path with re-verify (H1): a single read can hit a transitional
         // file the agent is mid-rewrite on.
         if let current = try? storeFile.read(), verifyApplied(current, wallpaperID: wallpaperID) {
@@ -507,9 +598,25 @@ final class HazelLockScreenService {
         _ = try await backupStore()
         var lastError: Error?
         var didRestore = false
+        // Outer pre-apply image for rollback: every verify failure restores to
+        // the state before this apply began, not to a per-pass snapshot that
+        // may itself be a failed edit. Captured from a stable read so a
+        // half-written stub never becomes the rollback target (H4).
+        let outerSnapshot: StoreSnapshot
+        do {
+            outerSnapshot = StoreSnapshot(previousContents: try await requireStableStore().raw, capturedAt: Date())
+        } catch {
+            lsLog("apply abort: no stable pre-apply snapshot error=\(error.localizedDescription)")
+            throw error
+        }
         for pass in 1...3 {
             lsLog("apply pass \(pass)/3 start id=\(wallpaperID.uuidString.prefix(8))")
             do {
+                // Re-stage every pass (cheap re-assert when current): a
+                // concurrent followSwitch sweep may have deleted our file
+                // after the previous pass, and the store edit below must never
+                // reference a missing file.
+                try await stage(video: video, wallpaperID: wallpaperID, title: title)
                 // Snapshot ONLY from a stable read (H4): restoring bytes taken
                 // during an agent rewrite would install a half-written stub and
                 // black-screen where the previous surface was fine. Abort the
@@ -521,7 +628,6 @@ final class HazelLockScreenService {
                     lsLog("apply pass \(pass)/3 no stable read, aborting before write error=\(error.localizedDescription)")
                     throw error
                 }
-                let stableSnapshot = StoreSnapshot(previousContents: stable.raw, capturedAt: Date())
                 _ = try storeFile.write(
                     try stable.store.setting(.desktop, to: lockscreenChoice(wallpaperID: wallpaperID),
                                              in: .everywhere, otherSlot: .keep))
@@ -535,9 +641,11 @@ final class HazelLockScreenService {
                     try await restartAgent()
                 } catch {
                     do {
-                        try storeFile.restore(stableSnapshot)
-                        lsLog("apply pass \(pass)/3 write/restart failed, restored stable snapshot error=\(error.localizedDescription)")
+                        try storeFile.restore(outerSnapshot)
+                        didRestore = true
+                        lsLog("apply pass \(pass)/3 write/restart failed, restored pre-apply snapshot error=\(error.localizedDescription)")
                     } catch {
+                        didRestore = false
                         lsLog("apply pass \(pass)/3 write/restart failed AND rollback failed error=\(error.localizedDescription)")
                     }
                     try? await restartAgent()
@@ -553,10 +661,11 @@ final class HazelLockScreenService {
                     lastError = PaperSaverError.verificationFailed(
                         expected: "\(Self.wallpaperExtensionID) as desktop everywhere", rolledBack: false)
                     do {
-                        try storeFile.restore(stableSnapshot)
+                        try storeFile.restore(outerSnapshot)
                         didRestore = true
-                        lsLog("apply pass \(pass)/3 rolled back to stable snapshot")
+                        lsLog("apply pass \(pass)/3 rolled back to pre-apply snapshot")
                     } catch {
+                        didRestore = false
                         lsLog("apply pass \(pass)/3 rollback FAILED error=\(error.localizedDescription)")
                     }
                     try? await restartAgent()
@@ -574,10 +683,11 @@ final class HazelLockScreenService {
                     lastError = PaperSaverError.verificationFailed(
                         expected: "\(Self.wallpaperExtensionID) as desktop everywhere (stable re-read)", rolledBack: false)
                     do {
-                        try storeFile.restore(stableSnapshot)
+                        try storeFile.restore(outerSnapshot)
                         didRestore = true
-                        lsLog("apply pass \(pass)/3 rolled back to stable snapshot after re-verify failure")
+                        lsLog("apply pass \(pass)/3 rolled back to pre-apply snapshot after re-verify failure")
                     } catch {
+                        didRestore = false
                         lsLog("apply pass \(pass)/3 rollback FAILED error=\(error.localizedDescription)")
                     }
                     try? await restartAgent()
@@ -613,10 +723,11 @@ final class HazelLockScreenService {
                     lastError = PaperSaverError.verificationFailed(
                         expected: "\(Self.wallpaperExtensionID) extension running (post-confirm)", rolledBack: false)
                     do {
-                        try storeFile.restore(stableSnapshot)
+                        try storeFile.restore(outerSnapshot)
                         didRestore = true
-                        lsLog("apply pass \(pass)/3 rolled back to stable snapshot after extension health failure")
+                        lsLog("apply pass \(pass)/3 rolled back to pre-apply snapshot after extension health failure")
                     } catch {
+                        didRestore = false
                         lsLog("apply pass \(pass)/3 rollback FAILED error=\(error.localizedDescription)")
                     }
                     try? await restartAgent()
@@ -629,10 +740,11 @@ final class HazelLockScreenService {
                     lastError = PaperSaverError.verificationFailed(
                         expected: "\(Self.wallpaperExtensionID) as desktop everywhere (post-confirm)", rolledBack: false)
                     do {
-                        try storeFile.restore(stableSnapshot)
+                        try storeFile.restore(outerSnapshot)
                         didRestore = true
-                        lsLog("apply pass \(pass)/3 rolled back to stable snapshot after final verify failure")
+                        lsLog("apply pass \(pass)/3 rolled back to pre-apply snapshot after final verify failure")
                     } catch {
+                        didRestore = false
                         lsLog("apply pass \(pass)/3 rollback FAILED error=\(error.localizedDescription)")
                     }
                     try? await restartAgent()
@@ -647,6 +759,21 @@ final class HazelLockScreenService {
                 }
                 return outcome
             } catch {
+                // A superseded apply must not spin the remaining passes: roll
+                // back to the pre-apply image (best-effort) and propagate so
+                // the gate releases immediately for the newer video.
+                if error is CancellationError {
+                    lsLog("apply pass \(pass)/3 cancelled, restoring pre-apply snapshot")
+                    do {
+                        try storeFile.restore(outerSnapshot)
+                        didRestore = true
+                    } catch {
+                        didRestore = false
+                    }
+                    try? await restartAgent()
+                    refresh()
+                    throw error
+                }
                 lastError = error
             }
             refresh()
@@ -663,10 +790,13 @@ final class HazelLockScreenService {
 
     /// Stable store + the raw bytes it decoded from. Throws when the file
     /// never quiesces within the bound — callers must abort BEFORE writing.
+    /// Throws CancellationError promptly so a superseded apply holding the
+    /// gate releases it instead of blocking the newer video.
     private func requireStableStore() async throws -> (store: SystemWallpaperStore, raw: Data) {
         var previous: Data?
         let deadline = ContinuousClock.now + .seconds(3)
         while ContinuousClock.now < deadline {
+            if Task.isCancelled { throw CancellationError() }
             let current = try? storeFile.readRaw()
             if let current, current == previous {
                 if let store = try? storeFile.read() {
@@ -701,19 +831,52 @@ final class HazelLockScreenService {
 
     /// Silent first-run + follow-switch path: stage, then apply only if never
     /// auto-applied before (never fights a manual change afterwards).
-    /// Concurrent callers for the SAME video coalesce onto one in-flight task;
-    /// a different video waits for the in-flight task then proceeds serially
-    /// (no dropped switches, no parallel agent restarts). The store-write +
-    /// restart itself is further serialized with manual applies via the apply
-    /// gate inside applyLockscreen (H3).
-    private final class AutomaticSlot {
-        var task: Task<Void, Never>?
-        var wallpaperID: UUID?
+    /// Serialization is via the gates, not via slot tasks: stages serialize
+    /// through the stage gate (FIFO, never-drop), store writes + restarts
+    /// serialize through the cancellable apply gate inside applyLockscreen
+    /// (H3). No slot means no dropped switches, no waiter leaks, and no
+    /// identity-clearing races: concurrent callers simply queue on the gates
+    /// and the fast-path re-checks inside the gates collapse duplicates.
+
+    /// Immediate per-switch staging (the lockscreen half of "swap immediately").
+    /// Called on EVERY wallpaper switch so the video lockscreen retargets at
+    /// once. `ensureAutomatic` below returns early once the extension is
+    /// applied (provider check only), so without this path no switch after the
+    /// first would ever reach the extension container.
+    ///
+    /// Copies the new video into the extension container and re-asserts
+    /// library.json + the Darwin retarget notification. Never touches the
+    /// wallpaper store and never (re-)applies: first-apply and healing stay in
+    /// ensureAutomatic/runAutomaticOnce, whose manual-removal opt-out and
+    /// hourly cap are untouched.
+    ///
+    /// Never-drop: waits ignore cancellation and every call stages exactly
+    /// once in FIFO arrival order (stage gate). A cancelled (superseded)
+    /// switch still stages — cheap when superseded (the newer switch stages
+    /// right after and wins) and required when it is the latest (otherwise the
+    /// container would keep the previous video while the desktop shows the
+    /// new one: stale video).
+    func followSwitch(video: URL, wallpaperID: UUID, title: String) async {
+        do {
+            let changed = try await stage(video: video, wallpaperID: wallpaperID, title: title)
+            lsLog("followSwitch staged id=\(wallpaperID.uuidString.prefix(8)) changed=\(changed)")
+        } catch {
+            // CancellationError cannot occur (stage gate waits ignore cancel
+            // and file ops do not check it); any other error is a real copy
+            // failure that the next switch/heal will retry.
+            if error is CancellationError {
+                lsLog("followSwitch cancelled but staged anyway id=\(wallpaperID.uuidString.prefix(8))")
+                return
+            }
+            lsLog("followSwitch stage failed id=\(wallpaperID.uuidString.prefix(8)) error=\(error.localizedDescription)")
+        }
     }
-    private let automaticSlot = AutomaticSlot()
-    private let automaticLock = NSLock()
 
     func ensureAutomatic(video: URL, wallpaperID: UUID, title: String) async {
+        // Steady-state fast path: cached applied needs no store re-read.
+        // Drift (external deselect) is healed by the watchdog/menu refresh;
+        // per-switch re-reads were pure plist cost on every switch.
+        if isApplied { return }
         refresh()
         if isApplied { return }
         if SettingsManager.shared.didAutoApplyLockscreen {
@@ -732,72 +895,27 @@ final class HazelLockScreenService {
                 return
             }
         }
-        let current: (task: Task<Void, Never>?, id: UUID?) = automaticLock.withLock {
-            (automaticSlot.task, automaticSlot.wallpaperID)
-        }
-        if let running = current.task {
-            let runningID = current.id
-            await running.value
-            // Same video: coalesced, nothing more to do. Different video:
-            // the in-flight apply is done, fall through and apply ours
-            // serially (the apply gate guarantees no interleave).
-            if runningID == wallpaperID {
-                return
-            }
-            // Re-check after waiting: the finished task may have applied us.
-            refresh()
-            if isApplied { return }
-            if SettingsManager.shared.didAutoApplyLockscreen {
-                if SettingsManager.shared.didManualRemoveLockscreen {
-                    lsLog("automatic skip manual opt-out after wait id=\(wallpaperID.uuidString.prefix(8))")
-                    return
-                }
-                if let last = SettingsManager.shared.lastLockscreenAutoAttempt,
-                   Date().timeIntervalSince(last) < 3600 {
-                    lsLog("automatic skip cooldown after wait id=\(wallpaperID.uuidString.prefix(8)) elapsed=\(Int(Date().timeIntervalSince(last)))s")
-                    return
-                }
-            }
-            let newer: Task<Void, Never>? = automaticLock.withLock { automaticSlot.task }
-            if let newer {
-                await newer.value
-                return
-            }
-            let created = Task { await self.runAutomaticOnce(video: video, wallpaperID: wallpaperID, title: title) }
-            automaticLock.withLock {
-                automaticSlot.task = created
-                automaticSlot.wallpaperID = wallpaperID
-            }
-            await created.value
-            automaticLock.withLock {
-                if automaticSlot.task?.hashValue == created.hashValue {
-                    automaticSlot.task = nil
-                    automaticSlot.wallpaperID = nil
-                }
-            }
-            return
-        }
-        let created = Task { await self.runAutomaticOnce(video: video, wallpaperID: wallpaperID, title: title) }
-        automaticLock.withLock {
-            automaticSlot.task = created
-            automaticSlot.wallpaperID = wallpaperID
-        }
-        await created.value
-        automaticLock.withLock {
-            if automaticSlot.task?.hashValue == created.hashValue {
-                automaticSlot.task = nil
-                automaticSlot.wallpaperID = nil
-            }
-        }
+        // No slot queue: concurrent callers serialize on the gates. Same-video
+        // duplicates collapse on the fast-path re-checks inside
+        // runAutomaticOnce/performApplyLockscreen (no extra writes/killalls);
+        // different videos apply serially, last wins, none dropped.
+        // A superseded (cancelled) caller aborts here to avoid stacking
+        // restarts behind the newer video; the newer video's own call still
+        // runs.
+        if Task.isCancelled { return }
+        await runAutomaticOnce(video: video, wallpaperID: wallpaperID, title: title)
     }
 
     private func runAutomaticOnce(video: URL, wallpaperID: UUID, title: String) async {
+        if Task.isCancelled { return }
         do {
-            _ = try stage(video: video, wallpaperID: wallpaperID, title: title)
+            _ = try await stage(video: video, wallpaperID: wallpaperID, title: title)
         } catch {
+            if error is CancellationError { return }
             lsLog("automatic stage failed id=\(wallpaperID.uuidString.prefix(8)) error=\(error.localizedDescription)")
             return
         }
+        if Task.isCancelled { return }
         refresh()
         if isApplied {
             lsLog("automatic skip already applied id=\(wallpaperID.uuidString.prefix(8))")
@@ -806,15 +924,21 @@ final class HazelLockScreenService {
         // First run, or heal path (ensureAutomatic already enforced the
         // manual-removal opt-out and the hourly attempt cap). The attempt stamp
         // is written ONLY on success: a failed attempt must not poison the
-        // hourly slot, or the lockscreen stays black for an hour. Coalescing
-        // against restart storms is handled by automaticSlot + the apply gate,
-        // not by pre-stamping.
+        // hourly slot, or the lockscreen stays black for an hour. Restart
+        // storms are absorbed by the cancellable apply gate (superseded
+        // waiters abort instead of stacking killalls), not by pre-stamping.
         do {
             // applyLockscreen takes the shared apply gate, so a manual click
             // racing this heal serializes instead of interleaving killalls.
+            // A superseded waiter throws CancellationError here and aborts
+            // without writing; the newer video's call proceeds serially.
             let outcome = try await applyLockscreen(video: video, wallpaperID: wallpaperID, title: title)
             lsLog("automatic apply done id=\(wallpaperID.uuidString.prefix(8)) outcome=\(outcome)")
         } catch {
+            if error is CancellationError {
+                lsLog("automatic apply superseded id=\(wallpaperID.uuidString.prefix(8)) (cancelled while queued)")
+                return
+            }
             // Clear the stamp so the next watchdog/switch tick retries soon
             // instead of sitting out the hourly cooldown while black.
             SettingsManager.shared.lastLockscreenAutoAttempt = nil
@@ -836,7 +960,7 @@ final class HazelLockScreenService {
     /// own screensaver choice).
     @discardableResult
     func removeLockscreen() async throws -> WriteOutcome {
-        await acquireApplyGate()
+        try await acquireApplyGate()
         defer { releaseApplyGate() }
         return try await performRemoveLockscreen()
     }
@@ -958,7 +1082,12 @@ final class HazelLockScreenService {
     // MARK: - Backups
 
     private var lockscreenBackupDir: URL {
-        fileManager.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
+        guard let base = fileManager.urls(for: .applicationSupportDirectory, in: .userDomainMask).first else {
+            lsLog("application support URL missing, using home fallback for backups")
+            return fileManager.homeDirectoryForCurrentUser
+                .appendingPathComponent("Library/Application Support/LiveWallpaper/LockScreenStoreBackups", isDirectory: true)
+        }
+        return base
             .appendingPathComponent("LiveWallpaper/LockScreenStoreBackups", isDirectory: true)
     }
 
@@ -969,7 +1098,7 @@ final class HazelLockScreenService {
     /// when the copy fails.
     @discardableResult
     func backupStore() async throws -> URL? {
-        guard let data = try? await awaitStableStoreBytes() else { return nil }
+        guard let data = try await awaitStableStoreBytes() else { return nil }
         try fileManager.createDirectory(at: lockscreenBackupDir, withIntermediateDirectories: true)
         let formatter = ISO8601DateFormatter()
         formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
@@ -985,19 +1114,45 @@ final class HazelLockScreenService {
     }
 
     /// Reads the store until two consecutive reads agree (or ~3s passes).
-    /// Returns nil when the store cannot be read at all.
+    /// Returns nil only when the store is stably absent (nothing to back up).
+    /// Throws when the file never quiesces or is unreadable — callers must
+    /// abort BEFORE writing instead of snapshotting stale bytes.
     private func awaitStableStoreBytes() async throws -> Data? {
         var previous: Data?
+        var previousMissing = false
+        var sawPresent = false
         let deadline = ContinuousClock.now + .seconds(3)
         while ContinuousClock.now < deadline {
-            let current = try? storeFile.readRaw()
-            if let current, current == previous {
-                return current
+            if Task.isCancelled { throw CancellationError() }
+            do {
+                let current = try storeFile.readRaw()
+                sawPresent = true
+                if let prev = previous, !previousMissing, prev == current {
+                    return current
+                }
+                previous = current
+                previousMissing = false
+            } catch let err as PaperSaverError {
+                if case .fileNotFound = err {
+                    if previousMissing {
+                        return nil
+                    }
+                    previous = nil
+                    previousMissing = true
+                } else {
+                    previousMissing = false
+                    lsLog("stable-bytes read error: \(err.localizedDescription)")
+                }
+            } catch {
+                previousMissing = false
+                lsLog("stable-bytes read error: \(error.localizedDescription)")
             }
-            previous = current
             try? await Task.sleep(for: .milliseconds(500))
         }
-        return previous
+        if previousMissing, !sawPresent {
+            return nil
+        }
+        throw PaperSaverError.plistReadError("no stable store bytes within bound; aborting before write")
     }
     private func sortedBackups() -> [URL] {
         let urls = ((try? fileManager.contentsOfDirectory(
@@ -1028,6 +1183,67 @@ final class HazelLockScreenService {
         for url in all.prefix(all.count - keeping) {
             try? fileManager.removeItem(at: url)
         }
+    }
+
+    /// True when at least one full-store backup exists to restore.
+    var hasBackup: Bool { latestBackup() != nil }
+
+    /// Manual rollback for the "Restore backup" button: writes the newest
+    /// full-store backup over the store, restarts the agent and verifies the
+    /// extension is gone. Serialized through the apply gate like every other
+    /// store-write + restart sequence. Failed verify rolls back to the
+    /// pre-restore stable snapshot (never leaves a half-restored store).
+    @discardableResult
+    func restoreLatestBackup() async throws -> WriteOutcome {
+        try await acquireApplyGate()
+        defer { releaseApplyGate() }
+        // Snapshot the pre-existing newest backup BEFORE snapshotting current
+        // state: backupStore() appends a new file that would otherwise become
+        // `latest`, restoring current state over itself (a no-op that fails
+        // verification while Hazel is applied).
+        guard let latest = latestBackup(),
+              let data = try? Data(contentsOf: latest) else {
+            throw PaperSaverError.fileNotFound(
+                lockscreenBackupDir.appendingPathComponent("latest.plist"))
+        }
+        lsLog("restore-backup start from=\(latest.lastPathComponent)")
+        _ = try await backupStore()
+        // Rollback image: stable pre-restore bytes (H4). A failed verify below
+        // restores these, so the store never ends in a half-restored state.
+        let stableSnapshot: StoreSnapshot
+        do {
+            stableSnapshot = StoreSnapshot(previousContents: try await requireStableStore().raw, capturedAt: Date())
+        } catch {
+            lsLog("restore-backup abort: no stable read before restore error=\(error.localizedDescription)")
+            throw error
+        }
+        do {
+            _ = try storeFile.writeRaw(data)
+        } catch {
+            lsLog("restore-backup write failed error=\(error.localizedDescription)")
+            throw error
+        }
+        try await restartAgent()
+        await settle()
+        refresh()
+        if isApplied {
+            lsLog("restore-backup verify FAILED still applied, rolling back to stable snapshot")
+            var rolledBack = false
+            do {
+                try storeFile.restore(stableSnapshot)
+                rolledBack = true
+                lsLog("restore-backup rolled back to stable snapshot")
+            } catch {
+                lsLog("restore-backup rollback FAILED error=\(error.localizedDescription)")
+            }
+            try? await restartAgent()
+            refresh()
+            throw PaperSaverError.verificationFailed(
+                expected: "desktop without \(Self.wallpaperExtensionID)", rolledBack: rolledBack)
+        }
+        SettingsManager.shared.didManualRemoveLockscreen = true
+        lsLog("restore-backup success")
+        return .applied
     }
 
     // MARK: - Agent control (bounded)
@@ -1082,10 +1298,11 @@ final class HazelLockScreenService {
     }
 
     /// Runs an executable from an absolute path with a hard timeout. Stdout +
-    /// stderr are drained continuously (no pipe deadlock on chatty tools) and the
-    /// process is terminated when the timeout fires, with a SIGKILL-grade grace
-    /// wait before giving up and reporting the timeout.
+    /// stderr are drained continuously (no pipe deadlock on chatty tools,
+    /// capped at 64KB to bound memory) and the process is SIGKILLed when the
+    /// timeout fires or the task is cancelled.
     func runProcess(_ executable: String, _ arguments: [String], timeout: Duration) async throws -> ProcessResult {
+        if Task.isCancelled { throw CancellationError() }
         let process = Process()
         process.executableURL = URL(fileURLWithPath: executable)
         process.arguments = arguments
@@ -1093,12 +1310,26 @@ final class HazelLockScreenService {
         process.standardOutput = pipe
         process.standardError = pipe
         var output = Data()
+        var truncated = false
+        let maxOutputBytes = 64 * 1024
         let outputLock = NSLock()
         pipe.fileHandleForReading.readabilityHandler = { handle in
             let chunk = handle.availableData
             if !chunk.isEmpty {
                 outputLock.lock()
-                output.append(chunk)
+                if !truncated {
+                    if output.count < maxOutputBytes {
+                        let remaining = maxOutputBytes - output.count
+                        if chunk.count <= remaining {
+                            output.append(chunk)
+                        } else {
+                            output.append(chunk.prefix(remaining))
+                            truncated = true
+                        }
+                    } else {
+                        truncated = true
+                    }
+                }
                 outputLock.unlock()
             }
         }
@@ -1109,8 +1340,24 @@ final class HazelLockScreenService {
             throw LockScreenError.processFailed(executable: executable, status: -1,
                                                 output: error.localizedDescription)
         }
+        func sigkill() {
+            let pid = process.processIdentifier
+            if pid > 0 { kill(pid, SIGKILL) }
+        }
         let deadline = ContinuousClock.now + timeout
         while process.isRunning {
+            if Task.isCancelled {
+                process.terminate()
+                let grace = ContinuousClock.now + .seconds(1)
+                while process.isRunning, ContinuousClock.now < grace {
+                    try? await Task.sleep(for: .milliseconds(50))
+                }
+                if process.isRunning {
+                    sigkill()
+                    try? await Task.sleep(for: .milliseconds(500))
+                }
+                throw CancellationError()
+            }
             if ContinuousClock.now >= deadline {
                 process.terminate()
                 let grace = ContinuousClock.now + .seconds(1)
@@ -1118,16 +1365,20 @@ final class HazelLockScreenService {
                     try? await Task.sleep(for: .milliseconds(50))
                 }
                 if process.isRunning {
-                    process.interrupt()
+                    sigkill()
                     try? await Task.sleep(for: .milliseconds(500))
                 }
                 throw LockScreenError.processTimeout(executable: executable)
             }
-            try await Task.sleep(for: .milliseconds(50))
+            try? await Task.sleep(for: .milliseconds(50))
         }
         outputLock.lock()
+        let wasTruncated = truncated
         let text = String(decoding: output, as: UTF8.self)
         outputLock.unlock()
+        if wasTruncated {
+            lsLog("\(executable) output truncated to \(maxOutputBytes) bytes")
+        }
         return ProcessResult(status: process.terminationStatus,
                              output: text.trimmingCharacters(in: .whitespacesAndNewlines))
     }

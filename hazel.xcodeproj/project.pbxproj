@@ -8,6 +8,7 @@
 
 /* Begin PBXFileReference section */
 		CC07CB942F7A5ABF004CBB12 /* hazel.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = hazel.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		CC07CC002F7A5B0004CBB12 /* hazelTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = hazelTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 /* End PBXFileReference section */
 
 /* Begin PBXFileSystemSynchronizedRootGroup section */
@@ -16,10 +17,22 @@
 			path = hazel;
 			sourceTree = "<group>";
 		};
+		CC07CC012F7A5B0004CBB12 /* hazelTests */ = {
+			isa = PBXFileSystemSynchronizedRootGroup;
+			path = hazelTests;
+			sourceTree = "<group>";
+		};
 /* End PBXFileSystemSynchronizedRootGroup section */
 
 /* Begin PBXFrameworksBuildPhase section */
 		CC07CB912F7A5ABF004CBB12 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		CC07CC122F7A5B0004CBB12 /* Frameworks */ = {
 			isa = PBXFrameworksBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
@@ -33,6 +46,7 @@
 			isa = PBXGroup;
 			children = (
 				CC07CB962F7A5ABF004CBB12 /* hazel */,
+				CC07CC012F7A5B0004CBB12 /* hazelTests */,
 				CC07CB952F7A5ABF004CBB12 /* Products */,
 			);
 			sourceTree = "<group>";
@@ -41,6 +55,7 @@
 			isa = PBXGroup;
 			children = (
 				CC07CB942F7A5ABF004CBB12 /* hazel.app */,
+				CC07CC002F7A5B0004CBB12 /* hazelTests.xctest */,
 			);
 			name = Products;
 			sourceTree = "<group>";
@@ -71,6 +86,29 @@
 			productReference = CC07CB942F7A5ABF004CBB12 /* hazel.app */;
 			productType = "com.apple.product-type.application";
 		};
+		CC07CC102F7A5B0004CBB12 /* hazelTests */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = CC07CC142F7A5B0004CBB12 /* Build configuration list for PBXNativeTarget "hazelTests" */;
+			buildPhases = (
+				CC07CC112F7A5B0004CBB12 /* Sources */,
+				CC07CC122F7A5B0004CBB12 /* Frameworks */,
+				CC07CC132F7A5B0004CBB12 /* Resources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+				CC07CC172F7A5B0004CBB12 /* PBXTargetDependency */,
+			);
+			fileSystemSynchronizedGroups = (
+				CC07CC012F7A5B0004CBB12 /* hazelTests */,
+			);
+			name = hazelTests;
+			packageProductDependencies = (
+			);
+			productName = "$(TARGET_NAME:c99extidentifier)";
+			productReference = CC07CC002F7A5B0004CBB12 /* hazelTests.xctest */;
+			productType = "com.apple.product-type.bundle.unit-test";
+		};
 /* End PBXNativeTarget section */
 
 /* Begin PBXProject section */
@@ -83,6 +121,10 @@
 				TargetAttributes = {
 					CC07CB932F7A5ABF004CBB12 = {
 						CreatedOnToolsVersion = 26.3;
+					};
+					CC07CC102F7A5B0004CBB12 = {
+						CreatedOnToolsVersion = 26.3;
+						TestTargetID = CC07CB932F7A5ABF004CBB12;
 					};
 				};
 			};
@@ -101,6 +143,7 @@
 			projectRoot = "";
 			targets = (
 				CC07CB932F7A5ABF004CBB12 /* hazel */,
+				CC07CC102F7A5B0004CBB12 /* hazelTests */,
 			);
 		};
 /* End PBXProject section */
@@ -113,10 +156,24 @@
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
+		CC07CC132F7A5B0004CBB12 /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
 /* End PBXResourcesBuildPhase section */
 
 /* Begin PBXSourcesBuildPhase section */
 		CC07CB902F7A5ABF004CBB12 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		CC07CC112F7A5B0004CBB12 /* Sources */ = {
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
@@ -154,10 +211,28 @@
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 			shellPath = /bin/sh;
-			shellScript = "set -e\nSAVER_STAGING=\"$BUILT_PRODUCTS_DIR/Hazel.saver\"\nSAVER_CONTENTS=\"$SAVER_STAGING/Contents\"\nSAVER_MACOS=\"$SAVER_CONTENTS/MacOS\"\nmkdir -p \"$SAVER_MACOS\"\nSDK_PATH=\"${SDKROOT:-$(xcrun --show-sdk-path)}\"\nDEPLOY_TARGET=\"${MACOSX_DEPLOYMENT_TARGET:-26.2}\"\nSLICES_DIR=\"$BUILT_PRODUCTS_DIR/HazelSaverSlices\"\nrm -rf \"$SLICES_DIR\"\nmkdir -p \"$SLICES_DIR\"\nfor ARCH in $ARCHS; do\nxcrun swiftc -O -sdk \"$SDK_PATH\" -target \"${ARCH}-apple-macosx${DEPLOY_TARGET}\" \"$PROJECT_DIR/hazel-saver/HazelSaverView.swift\" -framework ScreenSaver -framework AVFoundation -framework AppKit -Xlinker -bundle -o \"$SLICES_DIR/HazelSaver-$ARCH\"\ndone\nif [ \"$(echo \"$ARCHS\" | wc -w | tr -d ' ')\" -gt 1 ]; then\nlipo -create \"$SLICES_DIR\"/HazelSaver-* -output \"$SAVER_MACOS/HazelSaver\"\nelse\ncp \"$SLICES_DIR\"/HazelSaver-* \"$SAVER_MACOS/HazelSaver\"\nfi\nrm -rf \"$SLICES_DIR\"\ncp \"$PROJECT_DIR/hazel-saver/Info.plist\" \"$SAVER_CONTENTS/Info.plist\"\ncodesign --force --sign - \"$SAVER_STAGING\"\nDEST=\"${TARGET_BUILD_DIR}/${UNLOCALIZED_RESOURCES_FOLDER_PATH}/Hazel.saver\"\nrm -rf \"$DEST\"\ncp -R \"$SAVER_STAGING\" \"$DEST\"\ncodesign --force --sign - \"$DEST\"\nAPPEX_STAGING=\"$BUILT_PRODUCTS_DIR/HazelWallpaperExtension.appex\"\nAPPEX_CONTENTS=\"$APPEX_STAGING/Contents\"\nAPPEX_MACOS=\"$APPEX_CONTENTS/MacOS\"\nrm -rf \"$APPEX_STAGING\"\nmkdir -p \"$APPEX_MACOS\"\nAPPEX_SLICE_DIR=\"$BUILT_PRODUCTS_DIR/HazelAppexSlices\"\nrm -rf \"$APPEX_SLICE_DIR\"\nmkdir -p \"$APPEX_SLICE_DIR\"\nfor ARCH in $ARCHS; do\nxcrun swiftc -O -Xfrontend -application-extension -sdk \"$SDK_PATH\" -target \"${ARCH}-apple-macosx${DEPLOY_TARGET}\" \"$PROJECT_DIR\"/hazel-appex/Sources/*.swift -import-objc-header \"$PROJECT_DIR/hazel-appex/HazelExtension-Bridging-Header.h\" -framework AppKit -framework AVFoundation -framework CoreGraphics -framework QuartzCore -framework ExtensionFoundation -framework IOSurface -Xlinker -e -Xlinker _NSExtensionMain -o \"$APPEX_SLICE_DIR/HazelWallpaperExtension-$ARCH\"\ndone\nif [ \"$(echo \"$ARCHS\" | wc -w | tr -d ' ')\" -gt 1 ]; then\nlipo -create \"$APPEX_SLICE_DIR\"/HazelWallpaperExtension-* -output \"$APPEX_MACOS/HazelWallpaperExtension\"\nelse\ncp \"$APPEX_SLICE_DIR\"/HazelWallpaperExtension-* \"$APPEX_MACOS/HazelWallpaperExtension\"\nfi\nrm -rf \"$APPEX_SLICE_DIR\"\ncp \"$PROJECT_DIR/hazel-appex/Info.plist\" \"$APPEX_CONTENTS/Info.plist\"\ncodesign --force --sign - --identifier com.live.hazel.wallpaper-extension --entitlements \"$PROJECT_DIR/hazel-appex/HazelWallpaperExtension.entitlements\" \"$APPEX_STAGING\"\nEXTDEST=\"${TARGET_BUILD_DIR}/${FULL_PRODUCT_NAME}/Contents/Extensions/HazelWallpaperExtension.appex\"\nmkdir -p \"$(dirname \"$EXTDEST\")\"\nrm -rf \"$EXTDEST\"\ncp -R \"$APPEX_STAGING\" \"$EXTDEST\"\ncodesign --force --sign - --identifier com.live.hazel.wallpaper-extension --entitlements \"$PROJECT_DIR/hazel-appex/HazelWallpaperExtension.entitlements\" \"$EXTDEST\"\n";
+			shellScript = "set -e\nSAVER_STAGING=\"$BUILT_PRODUCTS_DIR/Hazel.saver\"\nSAVER_CONTENTS=\"$SAVER_STAGING/Contents\"\nSAVER_MACOS=\"$SAVER_CONTENTS/MacOS\"\nmkdir -p \"$SAVER_MACOS\"\nSDK_PATH=\"${SDKROOT:-$(xcrun --show-sdk-path)}\"\nDEPLOY_TARGET=\"${MACOSX_DEPLOYMENT_TARGET:-26.0}\"\nSLICES_DIR=\"$BUILT_PRODUCTS_DIR/HazelSaverSlices\"\nrm -rf \"$SLICES_DIR\"\nmkdir -p \"$SLICES_DIR\"\nfor ARCH in $ARCHS; do\nxcrun swiftc -O -sdk \"$SDK_PATH\" -target \"${ARCH}-apple-macosx${DEPLOY_TARGET}\" \"$PROJECT_DIR/hazel-saver/HazelSaverView.swift\" -framework ScreenSaver -framework AVFoundation -framework AppKit -Xlinker -bundle -o \"$SLICES_DIR/HazelSaver-$ARCH\"\ndone\nif [ \"$(echo \"$ARCHS\" | wc -w | tr -d ' ')\" -gt 1 ]; then\nlipo -create \"$SLICES_DIR\"/HazelSaver-* -output \"$SAVER_MACOS/HazelSaver\"\nelse\ncp \"$SLICES_DIR\"/HazelSaver-* \"$SAVER_MACOS/HazelSaver\"\nfi\nrm -rf \"$SLICES_DIR\"\ncp \"$PROJECT_DIR/hazel-saver/Info.plist\" \"$SAVER_CONTENTS/Info.plist\"\ncodesign --force --sign - \"$SAVER_STAGING\"\nDEST=\"${TARGET_BUILD_DIR}/${UNLOCALIZED_RESOURCES_FOLDER_PATH}/Hazel.saver\"\nrm -rf \"$DEST\"\ncp -R \"$SAVER_STAGING\" \"$DEST\"\ncodesign --force --sign - \"$DEST\"\nAPPEX_STAGING=\"$BUILT_PRODUCTS_DIR/HazelWallpaperExtension.appex\"\nAPPEX_CONTENTS=\"$APPEX_STAGING/Contents\"\nAPPEX_MACOS=\"$APPEX_CONTENTS/MacOS\"\nrm -rf \"$APPEX_STAGING\"\nmkdir -p \"$APPEX_MACOS\"\nAPPEX_SLICE_DIR=\"$BUILT_PRODUCTS_DIR/HazelAppexSlices\"\nrm -rf \"$APPEX_SLICE_DIR\"\nmkdir -p \"$APPEX_SLICE_DIR\"\nfor ARCH in $ARCHS; do\nxcrun swiftc -O -Xfrontend -application-extension -sdk \"$SDK_PATH\" -target \"${ARCH}-apple-macosx${DEPLOY_TARGET}\" \"$PROJECT_DIR\"/hazel-appex/Sources/*.swift -import-objc-header \"$PROJECT_DIR/hazel-appex/HazelExtension-Bridging-Header.h\" -framework AppKit -framework AVFoundation -framework CoreGraphics -framework QuartzCore -framework ExtensionFoundation -framework IOSurface -Xlinker -e -Xlinker _NSExtensionMain -o \"$APPEX_SLICE_DIR/HazelWallpaperExtension-$ARCH\"\ndone\nif [ \"$(echo \"$ARCHS\" | wc -w | tr -d ' ')\" -gt 1 ]; then\nlipo -create \"$APPEX_SLICE_DIR\"/HazelWallpaperExtension-* -output \"$APPEX_MACOS/HazelWallpaperExtension\"\nelse\ncp \"$APPEX_SLICE_DIR\"/HazelWallpaperExtension-* \"$APPEX_MACOS/HazelWallpaperExtension\"\nfi\nrm -rf \"$APPEX_SLICE_DIR\"\ncp \"$PROJECT_DIR/hazel-appex/Info.plist\" \"$APPEX_CONTENTS/Info.plist\"\ncodesign --force --sign - --identifier com.live.hazel.wallpaper-extension --entitlements \"$PROJECT_DIR/hazel-appex/HazelWallpaperExtension.entitlements\" \"$APPEX_STAGING\"\nEXTDEST=\"${TARGET_BUILD_DIR}/${FULL_PRODUCT_NAME}/Contents/Extensions/HazelWallpaperExtension.appex\"\nmkdir -p \"$(dirname \"$EXTDEST\")\"\nrm -rf \"$EXTDEST\"\ncp -R \"$APPEX_STAGING\" \"$EXTDEST\"\ncodesign --force --sign - --identifier com.live.hazel.wallpaper-extension --entitlements \"$PROJECT_DIR/hazel-appex/HazelWallpaperExtension.entitlements\" \"$EXTDEST\"\n";
 			showEnvVarsInLog = 0;
 		};
 /* End PBXShellScriptBuildPhase section */
+
+/* Begin PBXTargetDependency section */
+		CC07CC172F7A5B0004CBB12 /* PBXTargetDependency */ = {
+			isa = PBXTargetDependency;
+			target = CC07CB932F7A5ABF004CBB12 /* hazel */;
+			targetProxy = CC07CC182F7A5B0004CBB12 /* PBXContainerItemProxy */;
+		};
+/* End PBXTargetDependency section */
+
+/* Begin PBXContainerItemProxy section */
+		CC07CC182F7A5B0004CBB12 /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = CC07CB8C2F7A5ABF004CBB12 /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = CC07CB932F7A5ABF004CBB12;
+			remoteInfo = hazel;
+		};
+/* End PBXContainerItemProxy section */
 
 /* Begin XCBuildConfiguration section */
 		CC07CB9D2F7A5AC0004CBB12 /* Debug */ = {
@@ -213,7 +288,7 @@
 				GCC_WARN_UNUSED_FUNCTION = YES;
 				GCC_WARN_UNUSED_VARIABLE = YES;
 				LOCALIZATION_PREFERS_STRING_CATALOGS = YES;
-				MACOSX_DEPLOYMENT_TARGET = 26.2;
+				MACOSX_DEPLOYMENT_TARGET = 26.0;
 				MTL_ENABLE_DEBUG_INFO = INCLUDE_SOURCE;
 				MTL_FAST_MATH = YES;
 				ONLY_ACTIVE_ARCH = YES;
@@ -270,7 +345,7 @@
 				GCC_WARN_UNUSED_FUNCTION = YES;
 				GCC_WARN_UNUSED_VARIABLE = YES;
 				LOCALIZATION_PREFERS_STRING_CATALOGS = YES;
-				MACOSX_DEPLOYMENT_TARGET = 26.2;
+				MACOSX_DEPLOYMENT_TARGET = 26.0;
 				MTL_ENABLE_DEBUG_INFO = NO;
 				MTL_FAST_MATH = YES;
 				SDKROOT = macosx;
@@ -344,6 +419,75 @@
 			};
 			name = Release;
 		};
+		CC07CC152F7A5B0004CBB12 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				BUNDLE_LOADER = "$(TEST_HOST)";
+				CODE_SIGN_STYLE = Automatic;
+				COMBINE_HIDPI_IMAGES = YES;
+				COPY_PHASE_STRIP = NO;
+				CURRENT_PROJECT_VERSION = 1;
+				DEBUG_INFORMATION_FORMAT = dwarf;
+				ENABLE_TESTABILITY = YES;
+				GCC_OPTIMIZATION_LEVEL = 0;
+				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_KEY_CFBundleDisplayName = hazelTests;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/../Frameworks",
+					"@loader_path/../Frameworks",
+				);
+				MACOSX_DEPLOYMENT_TARGET = 26.0;
+				MARKETING_VERSION = 1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = com.live.hazel.hazelTests;
+				PRODUCT_NAME = "$(TARGET_NAME:c99extidentifier)";
+				SDKROOT = macosx;
+				STRING_CATALOG_GENERATE_SYMBOLS = YES;
+				SWIFT_ACTIVE_COMPILATION_CONDITIONS = "DEBUG $(inherited)";
+				SWIFT_APPROACHABLE_CONCURRENCY = YES;
+				SWIFT_DEFAULT_ACTOR_ISOLATION = MainActor;
+				SWIFT_EMIT_LOC_STRINGS = YES;
+				SWIFT_OPTIMIZATION_LEVEL = "-Onone";
+				SWIFT_UPCOMING_FEATURE_MEMBER_IMPORT_VISIBILITY = YES;
+				SWIFT_VERSION = 5.0;
+				TEST_HOST = "$(BUILT_PRODUCTS_DIR)/hazel.app/Contents/MacOS/hazel";
+				WRAPPER_EXTENSION = xctest;
+			};
+			name = Debug;
+		};
+		CC07CC162F7A5B0004CBB12 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				BUNDLE_LOADER = "$(TEST_HOST)";
+				CODE_SIGN_STYLE = Automatic;
+				COMBINE_HIDPI_IMAGES = YES;
+				COPY_PHASE_STRIP = NO;
+				CURRENT_PROJECT_VERSION = 1;
+				DEBUG_INFORMATION_FORMAT = "dwarf-with-dsym";
+				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_KEY_CFBundleDisplayName = hazelTests;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/../Frameworks",
+					"@loader_path/../Frameworks",
+				);
+				MACOSX_DEPLOYMENT_TARGET = 26.0;
+				MARKETING_VERSION = 1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = com.live.hazel.hazelTests;
+				PRODUCT_NAME = "$(TARGET_NAME:c99extidentifier)";
+				SDKROOT = macosx;
+				STRING_CATALOG_GENERATE_SYMBOLS = YES;
+				SWIFT_APPROACHABLE_CONCURRENCY = YES;
+				SWIFT_DEFAULT_ACTOR_ISOLATION = MainActor;
+				SWIFT_EMIT_LOC_STRINGS = YES;
+				SWIFT_UPCOMING_FEATURE_MEMBER_IMPORT_VISIBILITY = YES;
+				SWIFT_VERSION = 5.0;
+				SWIFT_COMPILATION_MODE = wholemodule;
+				TEST_HOST = "$(BUILT_PRODUCTS_DIR)/hazel.app/Contents/MacOS/hazel";
+				WRAPPER_EXTENSION = xctest;
+			};
+			name = Release;
+		};
 /* End XCBuildConfiguration section */
 
 /* Begin XCConfigurationList section */
@@ -361,6 +505,15 @@
 			buildConfigurations = (
 				CC07CBA02F7A5AC0004CBB12 /* Debug */,
 				CC07CBA12F7A5AC0004CBB12 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		CC07CC142F7A5B0004CBB12 /* Build configuration list for PBXNativeTarget "hazelTests" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				CC07CC152F7A5B0004CBB12 /* Debug */,
+				CC07CC162F7A5B0004CBB12 /* Release */,
 			);
 			defaultConfigurationIsVisible = 0;
 			defaultConfigurationName = Release;

@@ -67,10 +67,28 @@ class WallpaperStore: ObservableObject {
     }
 
     private var appSupportURL: URL {
-        let appSupport = fileManager.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
+        guard let appSupport = fileManager.urls(for: .applicationSupportDirectory, in: .userDomainMask).first else {
+            NSLog("[Hazel] WallpaperStore: application support URL missing, using home fallback")
+            return fileManager.homeDirectoryForCurrentUser.appendingPathComponent("Library/Application Support/LiveWallpaper", isDirectory: true)
+        }
         let appFolder = appSupport.appendingPathComponent("LiveWallpaper", isDirectory: true)
         ensureDirectory(at: appFolder)
         return appFolder
+    }
+
+    /// Read-path base: same location as appSupportURL but never creates
+    /// directories. load() runs synchronously on the main thread at launch;
+    /// a mkdir syscall there is pure first-frame cost. Writers keep using
+    /// appSupportURL/videosURL/storageURL (which ensure).
+    private var appSupportURLForRead: URL {
+        guard let appSupport = fileManager.urls(for: .applicationSupportDirectory, in: .userDomainMask).first else {
+            return fileManager.homeDirectoryForCurrentUser.appendingPathComponent("Library/Application Support/LiveWallpaper", isDirectory: true)
+        }
+        return appSupport.appendingPathComponent("LiveWallpaper", isDirectory: true)
+    }
+
+    private var storageURLForRead: URL {
+        appSupportURLForRead.appendingPathComponent("wallpapers.json")
     }
 
     private var videosURL: URL {
@@ -88,10 +106,47 @@ class WallpaperStore: ObservableObject {
         return wallpapers.first { $0.id == id }
     }
 
-    init() {
-        migrateContainerIfNeeded()
+    init(runMaintenance: Bool = true) {
         load()
-        repairMissingThumbnails()
+        wantsMaintenance = runMaintenance
+    }
+
+    /// Whether deferred maintenance was requested at init. The actual work
+    /// starts only via `startDeferredMaintenance()`, which the app calls
+    /// after the first video frame composites (or the launch fallback fires):
+    /// migration copies (100s of MB), stale-URL repair scans and thumbnail
+    /// decodes must never contend with the first-frame decode for disk/CPU/
+    /// decoder in the first minute.
+    private var wantsMaintenance = false
+    private var maintenanceStarted = false
+    private let maintenanceLock = NSLock()
+
+    /// Starts the deferred maintenance queued at init. Idempotent: safe to
+    /// call from both the first-frame callback and the launch fallback.
+    func startDeferredMaintenance() {
+        maintenanceLock.lock()
+        guard wantsMaintenance, !maintenanceStarted else {
+            maintenanceLock.unlock()
+            return
+        }
+        maintenanceStarted = true
+        maintenanceLock.unlock()
+        scheduleDeferredMaintenance()
+    }
+
+    /// Heavy library I/O stays off the launch critical path: load() above is
+    /// the only synchronous work (small JSON decode). Migration, stale-URL
+    /// repair and thumbnail repair run on a background queue after init returns,
+    /// so the first frame can composite while they work. Model mutations hop
+    /// back to the main thread. Background (not utility) so bulk copies and
+    /// thumbnail decodes never contend the live display decode.
+    private func scheduleDeferredMaintenance() {
+        DispatchQueue.global(qos: .background).async { [weak self] in
+            guard let self else { return }
+            self.migrateContainerIfNeeded()
+            self.repairStaleURLs()
+            self.repairMissingThumbnails()
+        }
     }
 
     /// One-way move from the old sandboxed container to the real Library paths
@@ -115,49 +170,81 @@ class WallpaperStore: ObservableObject {
         let containerJSON = containerAppSupport.appendingPathComponent("wallpapers.json")
         guard fileManager.fileExists(atPath: containerJSON.path) else { return }
 
-        let realAppSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
+        guard let appSupportBase = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first else {
+            NSLog("[Hazel] WallpaperStore: real application support URL missing, skipping migration")
+            return
+        }
+        let realAppSupport = appSupportBase
             .appendingPathComponent("LiveWallpaper", isDirectory: true)
         ensureDirectory(at: realAppSupport)
 
         var migratedAnything = false
-        guard let data = try? Data(contentsOf: containerJSON),
-              let items = try? JSONDecoder().decode([WallpaperItem].self, from: data) else {
+        var containerItems: [WallpaperItem]?
+        for attempt in 0..<2 {
+            if let data = try? Data(contentsOf: containerJSON),
+               let items = try? JSONDecoder().decode([WallpaperItem].self, from: data) {
+                containerItems = items
+                if attempt > 0 {
+                    NSLog("[Hazel] WallpaperStore: container library read recovered on retry %@", containerJSON.path)
+                }
+                break
+            } else if attempt == 0 {
+                NSLog("[Hazel] WallpaperStore: container library first read failed, retrying once %@", containerJSON.path)
+            }
+        }
+        guard let items = containerItems else {
             let size = fileSize(at: containerJSON) ?? -1
             NSLog("[Hazel] WallpaperStore: container library unreadable, leaving real library untouched %@ (size %d)", containerJSON.path, size)
             return
         }
         ensureDirectory(at: realAppSupport.appendingPathComponent("Videos", isDirectory: true))
-        for item in items {
-            let dst = realAppSupport.appendingPathComponent("Videos/\(item.url.lastPathComponent)")
-            if fileManager.fileExists(atPath: dst.path) {
-                // Retry a previous partial copy: size mismatch means truncated.
-                // atomicCopyItem replaces dst itself, so just re-copy.
-                if fileManager.fileExists(atPath: item.url.path),
-                   let srcSize = fileSize(at: item.url), srcSize > 0,
-                   fileSize(at: dst) != srcSize {
-                    if atomicCopyItem(from: item.url, to: dst) { migratedAnything = true }
-                }
-            } else if fileManager.fileExists(atPath: item.url.path) {
-                if atomicCopyItem(from: item.url, to: dst) { migratedAnything = true }
-            }
-            if let thumb = item.thumbnailPath {
-                let thumbName = URL(fileURLWithPath: thumb).lastPathComponent
-                let containerThumb = containerBase
-                    .appendingPathComponent("Caches/LiveWallpaper/Thumbnails/\(thumbName)")
-                let realThumbs = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first!
-                    .appendingPathComponent("LiveWallpaper/Thumbnails", isDirectory: true)
-                let dstThumb = realThumbs.appendingPathComponent(thumbName)
-                if fileManager.fileExists(atPath: dstThumb.path) {
-                    if fileManager.fileExists(atPath: containerThumb.path),
-                       let srcSize = fileSize(at: containerThumb), srcSize > 0,
-                       fileSize(at: dstThumb) != srcSize {
-                        ensureDirectory(at: realThumbs)
-                        if atomicCopyItem(from: containerThumb, to: dstThumb) { migratedAnything = true }
+        // Bulk video/thumbnail copies can be hundreds of MB: never block the
+        // main thread (launch) on them. The JSON below keeps referencing the
+        // container paths (the source is never deleted), so deferring the
+        // copies is safe; size checks retry anything outstanding next launch.
+        let itemsToMigrate = items
+        DispatchQueue.global(qos: .background).async { [weak self] in
+            guard let self else { return }
+            var migratedAnything = false
+            for item in itemsToMigrate {
+                let dst = realAppSupport.appendingPathComponent("Videos/\(item.url.lastPathComponent)")
+                if self.fileManager.fileExists(atPath: dst.path) {
+                    // Retry a previous partial copy: size mismatch means truncated.
+                    // atomicCopyItem replaces dst itself, so just re-copy.
+                    if self.fileManager.fileExists(atPath: item.url.path),
+                       let srcSize = self.fileSize(at: item.url), srcSize > 0,
+                       self.fileSize(at: dst) != srcSize {
+                        if self.atomicCopyItem(from: item.url, to: dst) { migratedAnything = true }
                     }
-                } else if fileManager.fileExists(atPath: containerThumb.path) {
-                    ensureDirectory(at: realThumbs)
-                    if atomicCopyItem(from: containerThumb, to: dstThumb) { migratedAnything = true }
+                } else if self.fileManager.fileExists(atPath: item.url.path) {
+                    if self.atomicCopyItem(from: item.url, to: dst) { migratedAnything = true }
                 }
+                if let thumb = item.thumbnailPath {
+                    let thumbName = URL(fileURLWithPath: thumb).lastPathComponent
+                    let containerThumb = containerBase
+                        .appendingPathComponent("Caches/LiveWallpaper/Thumbnails/\(thumbName)")
+                    guard let cachesBase = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first else {
+                        NSLog("[Hazel] WallpaperStore: caches URL missing, skipping thumbnail migration title=%@", item.title)
+                        continue
+                    }
+                    let realThumbs = cachesBase
+                        .appendingPathComponent("LiveWallpaper/Thumbnails", isDirectory: true)
+                    let dstThumb = realThumbs.appendingPathComponent(thumbName)
+                    if self.fileManager.fileExists(atPath: dstThumb.path) {
+                        if self.fileManager.fileExists(atPath: containerThumb.path),
+                           let srcSize = self.fileSize(at: containerThumb), srcSize > 0,
+                           self.fileSize(at: dstThumb) != srcSize {
+                            self.ensureDirectory(at: realThumbs)
+                            if self.atomicCopyItem(from: containerThumb, to: dstThumb) { migratedAnything = true }
+                        }
+                    } else if self.fileManager.fileExists(atPath: containerThumb.path) {
+                        self.ensureDirectory(at: realThumbs)
+                        if self.atomicCopyItem(from: containerThumb, to: dstThumb) { migratedAnything = true }
+                    }
+                }
+            }
+            if migratedAnything {
+                NSLog("[Hazel] WallpaperStore: migrated library out of sandbox container")
             }
         }
         let realJSON = realAppSupport.appendingPathComponent("wallpapers.json")
@@ -196,6 +283,89 @@ class WallpaperStore: ObservableObject {
         }
     }
 
+    /// Rewrites stored video URLs that no longer resolve (sandbox-container
+    /// move, renamed Videos dir, id-based rename). Runs once on load: for each
+    /// item whose file is missing, probes the real Videos dir for (a) the same
+    /// filename, (b) the container-path rewritten filename, (c) the
+    /// id-based name with the same extension, (d) any file prefixed with the
+    /// item id. Repairs in place and saves. Items with no candidate are left
+    /// untouched — validatedURL still returns nil and the controller aborts
+    /// gracefully instead of showing black.
+    ///
+    /// Deferred-maintenance context: called on a utility queue (see
+    /// scheduleDeferredMaintenance), so file probing stays off the main
+    /// thread; only the snapshot read and the model update hop to main.
+    private func repairStaleURLs() {
+        let snapshot: [WallpaperItem] = Thread.isMainThread
+            ? wallpapers
+            : DispatchQueue.main.sync { wallpapers }
+        guard !snapshot.isEmpty else { return }
+        let videosDir = videosURL
+        let existingFiles: [String]
+        do {
+            existingFiles = try fileManager.contentsOfDirectory(atPath: videosDir.path)
+        } catch {
+            NSLog("[Hazel] WallpaperStore: videos dir unreadable %@ : %@ — repair skipped", videosDir.path, error.localizedDescription)
+            return
+        }
+        var repairs: [(id: UUID, url: URL)] = []
+        var missingTitles: [(title: String, path: String)] = []
+        for item in snapshot {
+            if fileManager.fileExists(atPath: item.url.path) { continue }
+            let ext = item.url.pathExtension
+            var candidates: [URL] = []
+            // Same filename in the real library (covers container-path items
+            // whose name survived the move).
+            candidates.append(videosDir.appendingPathComponent(item.url.lastPathComponent))
+            // Id-based name with the same extension (current addWallpaper layout).
+            if !ext.isEmpty {
+                candidates.append(videosDir.appendingPathComponent("\(item.id.uuidString).\(ext)"))
+            }
+            // Any file carrying the item id prefix (extension changed, etc.).
+            let prefix = item.id.uuidString.lowercased()
+            if let prefixed = existingFiles.first(where: { $0.lowercased().hasPrefix(prefix) }) {
+                candidates.append(videosDir.appendingPathComponent(prefixed))
+            }
+            if let hit = candidates.first(where: { fileManager.fileExists(atPath: $0.path) }) {
+                NSLog("[Hazel] WallpaperStore: repaired stale URL title=%@ %@ -> %@",
+                      item.title, item.url.path, hit.path)
+                repairs.append((item.id, hit))
+            } else {
+                missingTitles.append((item.title, item.url.path))
+            }
+        }
+        for missing in missingTitles {
+            NSLog("[Hazel] WallpaperStore: file missing, no repair candidate title=%@ path=%@",
+                  missing.title, missing.path)
+        }
+        guard !repairs.isEmpty || !missingTitles.isEmpty else { return }
+        let activeID: UUID? = Thread.isMainThread
+            ? activeWallpaperID
+            : DispatchQueue.main.sync { activeWallpaperID }
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            var changed = false
+            for repair in repairs {
+                if let index = self.wallpapers.firstIndex(where: { $0.id == repair.id }) {
+                    self.wallpapers[index].url = repair.url
+                    changed = true
+                }
+            }
+            if changed {
+                self.save()
+            }
+            // Active pointer into a still-missing file must not auto-play black:
+            // leave the item for the user, but the controller will abort (isActive
+            // stays false) instead of ordering windows.
+            if let id = activeID,
+               let active = self.wallpapers.first(where: { $0.id == id }),
+               !self.fileManager.fileExists(atPath: active.url.path) {
+                NSLog("[Hazel] WallpaperStore: active wallpaper missing file title=%@ path=%@ — launch will idle until reselected",
+                      active.title, active.url.path)
+            }
+        }
+    }
+
     /// Regenerates thumbnails whose files went missing. Generation runs off the
     /// main thread; only the model update + save hop back.
     private func repairMissingThumbnails() {
@@ -205,7 +375,7 @@ class WallpaperStore: ObservableObject {
         }
         guard !missing.isEmpty else { return }
         let items = missing.map { (index: $0, url: wallpapers[$0].url, id: wallpapers[$0].id) }
-        DispatchQueue.global(qos: .utility).async { [weak self] in
+        DispatchQueue.global(qos: .background).async { [weak self] in
             var repaired: [(Int, String)] = []
             for item in items {
                 if let path = self?.generateThumbnail(for: item.url, id: item.id) {
@@ -224,11 +394,14 @@ class WallpaperStore: ObservableObject {
     }
 
     /// Tolerates a torn read from an in-flight atomic save: one short retry,
-    /// then keeps the existing model (never caches garbage).
+    /// then keeps the existing model (never caches garbage). Read path never
+    /// creates directories (see storageURLForRead): launch must not pay a
+    /// mkdir before the first frame.
     func load() {
-        guard fileManager.fileExists(atPath: storageURL.path) else { return }
+        let url = storageURLForRead
+        guard fileManager.fileExists(atPath: url.path) else { return }
         do {
-            let data = try Data(contentsOf: storageURL)
+            let data = try Data(contentsOf: url)
             wallpapers = try JSONDecoder().decode([WallpaperItem].self, from: data)
             if let idString = UserDefaults.standard.string(forKey: "activeWallpaperID"),
                let id = UUID(uuidString: idString),
@@ -237,13 +410,16 @@ class WallpaperStore: ObservableObject {
             }
             if loadHadFailure {
                 loadHadFailure = false
-                NSLog("[Hazel] WallpaperStore: library load recovered %@", storageURL.path)
+                NSLog("[Hazel] WallpaperStore: library load recovered %@", url.path)
             }
         } catch {
-            // Possible torn read mid-rename: one short retry before giving up.
-            Thread.sleep(forTimeInterval: 0.05)
+            // Possible torn read mid-rename: one immediate retry before giving
+            // up. No sleep: this runs on the main thread at launch and the
+            // second read of an atomic rename almost always wins.
+            // Log the first failure so torn reads are visible in Console.app.
+            NSLog("[Hazel] WallpaperStore: library load first read failed %@ : %@ — retrying once", url.path, (error as NSError).localizedDescription)
             do {
-                let data = try Data(contentsOf: storageURL)
+                let data = try Data(contentsOf: url)
                 wallpapers = try JSONDecoder().decode([WallpaperItem].self, from: data)
                 if let idString = UserDefaults.standard.string(forKey: "activeWallpaperID"),
                    let id = UUID(uuidString: idString),
@@ -252,12 +428,12 @@ class WallpaperStore: ObservableObject {
                 }
                 if loadHadFailure {
                     loadHadFailure = false
-                    NSLog("[Hazel] WallpaperStore: library load recovered %@", storageURL.path)
+                    NSLog("[Hazel] WallpaperStore: library load recovered %@", url.path)
                 }
             } catch {
                 loadHadFailure = true
-                let size = fileSize(at: storageURL) ?? -1
-                NSLog("[Hazel] WallpaperStore: library load failed %@ (size %d) : %@ — keeping existing model", storageURL.path, size, (error as NSError).localizedDescription)
+                let size = fileSize(at: url) ?? -1
+                NSLog("[Hazel] WallpaperStore: library load failed %@ (size %d) : %@ — keeping existing model", url.path, size, (error as NSError).localizedDescription)
             }
         }
     }
@@ -301,14 +477,23 @@ class WallpaperStore: ObservableObject {
         }
 
         let itemURL = destinationURL
-        var item = WallpaperItem(url: itemURL, title: title)
-
-        if let thumbnailPath = generateThumbnail(for: itemURL, id: id) {
-            item.thumbnailPath = thumbnailPath
-        }
+        let item = WallpaperItem(url: itemURL, title: title)
 
         wallpapers.insert(item, at: 0)
         save()
+        // Thumbnail decode must not block the caller (main thread during
+        // import): AVAssetImageGenerator can stall up to 10s on a slow file.
+        // Insert first, fill the thumbnail in when the background pass lands.
+        let insertedID = item.id
+        DispatchQueue.global(qos: .background).async { [weak self, itemURL] in
+            guard let self, let path = self.generateThumbnail(for: itemURL, id: insertedID) else { return }
+            DispatchQueue.main.async { [weak self] in
+                guard let self,
+                      let index = self.wallpapers.firstIndex(where: { $0.id == insertedID }) else { return }
+                self.wallpapers[index].thumbnailPath = path
+                self.save()
+            }
+        }
         return item
     }
 
@@ -359,15 +544,31 @@ class WallpaperStore: ObservableObject {
     /// (No security-scoped bookmarks are used: Hazel copies imports into its
     /// own folder and validates plain paths instead.)
     func validatedURL(_ url: URL) -> URL? {
-        guard fileManager.fileExists(atPath: url.path) else {
+        var isDir: ObjCBool = false
+        guard fileManager.fileExists(atPath: url.path, isDirectory: &isDir) else {
             NSLog("[Hazel] WallpaperStore: file missing at path: %@", url.path)
+            return nil
+        }
+        if isDir.boolValue {
+            NSLog("[Hazel] WallpaperStore: path is directory, not a file: %@", url.path)
+            return nil
+        }
+        if let size = (try? fileManager.attributesOfItem(atPath: url.path)[.size] as? NSNumber)?.intValue, size == 0 {
+            NSLog("[Hazel] WallpaperStore: file is zero bytes: %@", url.path)
+            return nil
+        }
+        guard fileManager.isReadableFile(atPath: url.path) else {
+            NSLog("[Hazel] WallpaperStore: file unreadable at path: %@", url.path)
             return nil
         }
         return url
     }
 
     private func generateThumbnail(for url: URL, id: UUID) -> String? {
-        let cachesDir = fileManager.urls(for: .cachesDirectory, in: .userDomainMask).first!
+        guard let cachesDir = fileManager.urls(for: .cachesDirectory, in: .userDomainMask).first else {
+            NSLog("[Hazel] WallpaperStore: caches URL missing, cannot generate thumbnail id=%@", id.uuidString)
+            return nil
+        }
         let thumbnailsDir = cachesDir.appendingPathComponent("LiveWallpaper/Thumbnails", isDirectory: true)
         ensureDirectory(at: thumbnailsDir)
 

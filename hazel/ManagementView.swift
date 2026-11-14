@@ -174,7 +174,7 @@ struct ManagementView: View {
     }
 }
 
-// MARK: - Settings window (menu bar > Hazel > Settings…)
+// MARK: - Settings window (menu bar > Hazel Settings)
 
 /// Manual Settings panel mirroring ManagementWindowController. Used instead of
 /// the SwiftUI Settings scene for the menu item because LSUIElement apps have

@@ -213,11 +213,17 @@ enum HazelFrameCache {
         memory = image
         lock.unlock()
         // Best-effort persist; failure just means no cross-launch fallback.
-        let url = diskURL
-        guard let dest = CGImageDestinationCreateWithURL(
-            url as CFURL, "public.png" as CFString, 1, nil) else { return }
-        CGImageDestinationAddImage(dest, image, nil)
-        CGImageDestinationFinalize(dest)
+        // OFF the first-frame critical path: the PNG encode + file write for
+        // a 4K frame costs hundreds of ms on a cold disk and must never gate
+        // the acquire reply. Memory (above) is set synchronously; only the
+        // disk persist hops to a utility queue.
+        DispatchQueue.global(qos: .utility).async {
+            let url = diskURL
+            guard let dest = CGImageDestinationCreateWithURL(
+                url as CFURL, "public.png" as CFString, 1, nil) else { return }
+            CGImageDestinationAddImage(dest, image, nil)
+            CGImageDestinationFinalize(dest)
+        }
     }
 
     static func load() -> CGImage? {
@@ -255,17 +261,50 @@ enum HazelFrameCache {
 }
 
 enum HazelSnapshot {
+    /// Fast-start seed budget: the cold still is decoded at or below this
+    /// width (aspect preserved). A 3724px-wide hvc1 first frame costs ~7MP of
+    /// HEVC decode + a ~29MB pixel buffer; 1280px is ~0.9MP and composites
+    /// through the aspect-fill layer indistinguishably for the second(s)
+    /// until the full-res video frames refine it.
+    static let seedMaxWidth: CGFloat = 1280
+
+    /// Target seed size for a destination: aspect-fill needs at most the
+    /// destination pixels, capped by the fast-start budget above so a 4K
+    /// source never pays a full-res still decode on the cold path.
+    static func seedSize(forDestination dest: CGSize) -> CGSize {
+        let w = max(1, min(dest.width, seedMaxWidth))
+        let h = max(1, dest.height * (w / max(1, dest.width)))
+        return CGSize(width: w, height: h)
+    }
+
     /// First-frame CGImage of a video, for the cold-start still seed.
-    static func firstFrameImage(videoURL: URL) async -> CGImage? {
-        let asset = AVURLAsset(url: videoURL)
+    /// `maximumSize` bounds the decode (aspect preserved): pass the capped
+    /// seed size so a 4K source never pays a full-res still decode before the
+    /// acquire reply. Timed via hazelLog for cold-path profiling.
+    static func firstFrameImage(videoURL: URL, maximumSize: CGSize? = nil) async -> CGImage? {
+        await firstFrameImage(asset: AVURLAsset(url: videoURL),
+                              fallbackName: videoURL.lastPathComponent,
+                              maximumSize: maximumSize)
+    }
+
+    /// Asset-sharing overload: the caller already opened this asset for the
+    /// track probe, so the seed reuses it instead of paying a second open +
+    /// moov parse on the cold path.
+    static func firstFrameImage(asset: AVURLAsset, fallbackName: String,
+                                maximumSize: CGSize? = nil) async -> CGImage? {
+        let t0 = Date()
         let generator = AVAssetImageGenerator(asset: asset)
         generator.appliesPreferredTrackTransform = true
+        if let maximumSize {
+            generator.maximumSize = maximumSize
+        }
         do {
             let img = try await generator.image(at: .zero).image
+            hazelLog("  [Seed] decoded \(img.width)x\(img.height) in \(String(format: "%.2f", Date().timeIntervalSince(t0)))s (max \(maximumSize.map { "\(Int($0.width))x\(Int($0.height))" } ?? "full"))")
             HazelFrameCache.store(img)
             return img
         } catch {
-            hazelLog("  [Seed] AVAssetImageGenerator failed for \(videoURL.lastPathComponent): \(error) — trying frame cache")
+            hazelLog("  [Seed] AVAssetImageGenerator failed for \(fallbackName): \(error) — trying frame cache")
             if let cached = HazelFrameCache.load() {
                 hazelLog("  [Seed] using cached last-good frame")
                 return cached
@@ -278,8 +317,8 @@ enum HazelSnapshot {
     /// Infallible seed: never returns nil. Generator failure falls back to
     /// the cached last-good frame, then to a solid color, so the caller can
     /// always composite something before replying to acquire.
-    static func seedImage(videoURL: URL) async -> CGImage {
-        if let img = await firstFrameImage(videoURL: videoURL) { return img }
+    static func seedImage(videoURL: URL, maximumSize: CGSize? = nil) async -> CGImage {
+        if let img = await firstFrameImage(videoURL: videoURL, maximumSize: maximumSize) { return img }
         // firstFrameImage already falls back to solid; this is the
         // belt-and-braces path if even that construction failed.
         if let cached = HazelFrameCache.load() { return cached }
@@ -289,6 +328,25 @@ enum HazelSnapshot {
         w = 1; h = 1
         let space = CGColorSpaceCreateDeviceRGB()
         let ctx = CGContext(data: nil, width: w, height: h, bitsPerComponent: 8,
+                            bytesPerRow: 0, space: space,
+                            bitmapInfo: CGImageAlphaInfo.premultipliedFirst.rawValue
+                                | CGBitmapInfo.byteOrder32Little.rawValue)!
+        ctx.setFillColor(CGColor(red: 0.07, green: 0.09, blue: 0.17, alpha: 1.0))
+        ctx.fill(CGRect(x: 0, y: 0, width: 1, height: 1))
+        return ctx.makeImage()!
+    }
+
+    /// Asset-sharing infallible seed: same contract as above, but reuses the
+    /// caller's already-open asset so the cold path pays one open + one moov
+    /// parse, not two.
+    static func seedImage(asset: AVURLAsset, fallbackName: String,
+                          maximumSize: CGSize? = nil) async -> CGImage {
+        if let img = await firstFrameImage(asset: asset, fallbackName: fallbackName,
+                                           maximumSize: maximumSize) { return img }
+        if let cached = HazelFrameCache.load() { return cached }
+        if let solid = HazelFrameCache.solidFallback() { return solid }
+        let space = CGColorSpaceCreateDeviceRGB()
+        let ctx = CGContext(data: nil, width: 1, height: 1, bitsPerComponent: 8,
                             bytesPerRow: 0, space: space,
                             bitmapInfo: CGImageAlphaInfo.premultipliedFirst.rawValue
                                 | CGBitmapInfo.byteOrder32Little.rawValue)!

@@ -1,6 +1,6 @@
 import SwiftUI
 
-/// System Settings panel (opens via Cmd+, or Hazel menu > Settings).
+/// System Settings panel (opens via Cmd+, or menu bar > Hazel Settings).
 /// Owns every user-facing setting; the library window stays a pure gallery.
 struct SettingsView: View {
     private enum CycleChoice: Hashable {
@@ -13,6 +13,7 @@ struct SettingsView: View {
 
     @State private var syncSystemWallpaper = SettingsManager.shared.syncSystemWallpaper
     @State private var wallpaperFit = SettingsManager.shared.wallpaperFit
+    @State private var menuBarIcon = SettingsManager.shared.menuBarIcon
     @State private var cycleChoice: CycleChoice = Self.currentChoice()
     @State private var cycleValue = SettingsManager.shared.cycleIntervalValue
     @State private var cycleUnit = SettingsManager.shared.cycleIntervalUnit
@@ -22,6 +23,11 @@ struct SettingsView: View {
     @State private var isSelectingSaver = false
     @State private var lockscreenActive = HazelLockScreenService.shared.isApplied
     @State private var isApplyingLockscreen = false
+    @State private var hasBackup = HazelLockScreenService.shared.hasBackup
+    @State private var supportReason: String? = ScreensaverSelectService.shared.supportReason
+    @State private var installedSaverVersion: String? = ScreensaverSelectService.shared.installedSaverVersion
+    @State private var bundledSaverVersion: String? = ScreensaverSelectService.shared.bundledSaverVersion
+    @State private var isBundleCurrent = ScreensaverSelectService.shared.isBundleCurrent
     @State private var errorMessage = ""
     @State private var showingError = false
 
@@ -47,6 +53,17 @@ struct SettingsView: View {
 
     var body: some View {
         Form {
+            Section("Menu Bar") {
+                Picker("Menu icon", selection: $menuBarIcon) {
+                    ForEach(MenuBarIcon.allCases, id: \.self) { icon in
+                        Text(icon.title).tag(icon)
+                    }
+                }
+                .onChange(of: menuBarIcon) { _, newValue in
+                    SettingsManager.shared.menuBarIcon = newValue
+                }
+            }
+
             Section("Wallpaper") {
                 Toggle("Sync system wallpaper", isOn: $syncSystemWallpaper)
                     .onChange(of: syncSystemWallpaper) { _, newValue in
@@ -120,24 +137,43 @@ struct SettingsView: View {
 
             Section("Screensaver and lockscreen") {
                 VStack(alignment: .leading, spacing: 6) {
-                    Text("Video screensaver and lockscreen")
-                    Text(screensaverStatusText)
+                    Toggle("Use Hazel for screensaver and lockscreen", isOn: Binding(
+                        get: { isSaverSelected && lockscreenActive },
+                        set: { on in Task { on ? await runCombinedActivation() : await runDisable() } }
+                    ))
+                    .disabled(!isSupported || isWorking)
+                    .help(supportReason ?? "On: screensaver and lockscreen play the current video. Off: system default.")
+                    Text(combinedStatusText)
                         .font(.caption)
                         .foregroundColor(.secondary)
-                    Button(screensaverButtonTitle) {
-                        Task { await runCombinedActivation() }
+                    Text(versionCaption)
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                    HStack {
+                        Button("Re-apply") {
+                            Task { await runCombinedActivation() }
+                        }
+                        .disabled(!isSupported || isWorking)
+                        Button("Restore backup") {
+                            Task { await runRestoreBackup() }
+                        }
+                        .disabled(!isSupported || isWorking || !hasBackup)
                     }
-                    .disabled(isSelectingSaver || isApplyingLockscreen)
-                    .frame(maxWidth: .infinity)
                 }
             }
         }
         .formStyle(.grouped)
-        .frame(width: 460, height: 430)
+        .frame(width: 460, height: 500)
         .padding(8)
         .onAppear(perform: refreshAll)
         .onReceive(NotificationCenter.default.publisher(for: .hazelCycleSettingsChanged)) { _ in
-            refreshAll()
+            // Cycle-only: this fires on every wallpaper switch. The saver/
+            // lockscreen store re-reads stay in refreshAll (appear + explicit
+            // activation) so switches never cost plist decodes on main.
+            refreshCycleFields()
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .hazelMenuBarIconChanged)) { _ in
+            menuBarIcon = SettingsManager.shared.menuBarIcon
         }
         .alert("Settings error", isPresented: $showingError) {
             Button("OK", role: .cancel) { }
@@ -147,17 +183,27 @@ struct SettingsView: View {
     }
 
     private func refreshAll() {
+        refreshCycleFields()
+        ScreensaverSelectService.shared.refresh()
+        isSaverSelected = ScreensaverSelectService.shared.isSelected
+        HazelLockScreenService.shared.refresh()
+        lockscreenActive = HazelLockScreenService.shared.isApplied
+        hasBackup = HazelLockScreenService.shared.hasBackup
+        supportReason = ScreensaverSelectService.shared.supportReason
+        installedSaverVersion = ScreensaverSelectService.shared.installedSaverVersion
+        bundledSaverVersion = ScreensaverSelectService.shared.bundledSaverVersion
+        isBundleCurrent = ScreensaverSelectService.shared.isBundleCurrent
+    }
+
+    private func refreshCycleFields() {
         syncSystemWallpaper = SettingsManager.shared.syncSystemWallpaper
         wallpaperFit = SettingsManager.shared.wallpaperFit
+        menuBarIcon = SettingsManager.shared.menuBarIcon
         cycleChoice = Self.currentChoice()
         cycleValue = SettingsManager.shared.cycleIntervalValue
         cycleUnit = SettingsManager.shared.cycleIntervalUnit
         cycleDailyHour = SettingsManager.shared.cycleDailyHour
         cycleDailyMinute = SettingsManager.shared.cycleDailyMinute
-        ScreensaverSelectService.shared.refresh()
-        isSaverSelected = ScreensaverSelectService.shared.isSelected
-        HazelLockScreenService.shared.refresh()
-        lockscreenActive = HazelLockScreenService.shared.isApplied
     }
 
     private func applyChoice(_ choice: CycleChoice) {
@@ -184,21 +230,40 @@ struct SettingsView: View {
         cycleChoice = .custom
     }
 
-    private var screensaverStatusText: String {
-        if isSelectingSaver || isApplyingLockscreen { return "Working…" }
+    /// Single-toggle truth: ON only when BOTH saver and lockscreen run Hazel.
+    /// A mixed state (e.g. saver on, lockscreen off) is drift, never "on" —
+    /// it reads as Partial with a pointer to fix it.
+    private var combinedStatusText: String {
+        if isWorking { return "Working…" }
+        if !isSupported { return supportReason ?? "Unsupported on this Mac." }
         switch (isSaverSelected, lockscreenActive) {
-        case (true, true): return "On — plays the current video."
-        case (true, false): return "Screensaver on, lockscreen off."
-        case (false, true): return "Lockscreen on, screensaver off."
-        case (false, false): return "Off"
+        case (true, true): return "On — screensaver and lockscreen play the current video."
+        case (false, false): return "Off — using the system default."
+        case (true, false): return "Partial — screensaver on, lockscreen off. Turn off then on, or restore the backup."
+        case (false, true): return "Partial — lockscreen on, screensaver off. Turn off then on, or restore the backup."
         }
     }
 
-    private var screensaverButtonTitle: String {
-        (isSaverSelected && lockscreenActive) ? "Re-apply" : "Use Hazel for screensaver and lockscreen"
+    private var isSupported: Bool { supportReason == nil }
+
+    private var isWorking: Bool { isSelectingSaver || isApplyingLockscreen }
+
+    private var versionCaption: String {
+        if !isSupported { return supportReason ?? "" }
+        switch (installedSaverVersion, bundledSaverVersion) {
+        case let (installed?, bundled?):
+            return isBundleCurrent
+                ? "Saver v\(installed) — up to date."
+                : "Saver v\(installed) installed, v\(bundled) bundled — Re-apply to update."
+        case (_, let bundled?):
+            return "Saver not installed yet — bundled v\(bundled)."
+        default:
+            return ""
+        }
     }
 
     private func runCombinedActivation() async {
+        guard isSupported else { return }
         isSelectingSaver = true
         isApplyingLockscreen = true
         defer {
@@ -211,9 +276,38 @@ struct SettingsView: View {
             errorMessage = error.localizedDescription
             showingError = true
         }
-        ScreensaverSelectService.shared.refresh()
-        isSaverSelected = ScreensaverSelectService.shared.isSelected
-        HazelLockScreenService.shared.refresh()
-        lockscreenActive = HazelLockScreenService.shared.isApplied
+        refreshAll()
+    }
+
+    private func runDisable() async {
+        isSelectingSaver = true
+        isApplyingLockscreen = true
+        defer {
+            isSelectingSaver = false
+            isApplyingLockscreen = false
+        }
+        do {
+            try await ScreensaverSelectService.shared.deactivateToSystemDefault()
+        } catch {
+            errorMessage = error.localizedDescription
+            showingError = true
+        }
+        refreshAll()
+    }
+
+    private func runRestoreBackup() async {
+        isSelectingSaver = true
+        isApplyingLockscreen = true
+        defer {
+            isSelectingSaver = false
+            isApplyingLockscreen = false
+        }
+        do {
+            try await ScreensaverSelectService.shared.restoreSystemBackup()
+        } catch {
+            errorMessage = error.localizedDescription
+            showingError = true
+        }
+        refreshAll()
     }
 }

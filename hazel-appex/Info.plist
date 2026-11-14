@@ -26,6 +26,6 @@
 		<string>com.apple.wallpaper</string>
 	</dict>
 	<key>LSMinimumSystemVersion</key>
-	<string>26.2</string>
+	<string>26.0</string>
 </dict>
 </plist>

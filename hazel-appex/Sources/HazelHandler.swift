@@ -95,6 +95,8 @@ final class HazelRegistryStore: @unchecked Sendable {
     private nonisolated(unsafe) var idToKey: [UUID: HazelSurfaceKey] = [:]
     private nonisolated(unsafe) var pendingTeardown: [HazelSurfaceKey: DispatchWorkItem] = [:]
     private nonisolated(unsafe) var rendererInFlight: Set<HazelSurfaceKey> = []
+    private nonisolated(unsafe) var retargetLibraryWork: DispatchWorkItem?
+    private nonisolated(unsafe) var retargetAllWork: DispatchWorkItem?
 
     func surface(for key: HazelSurfaceKey) -> HazelHostedSurface? {
         lock.lock(); defer { lock.unlock() }
@@ -175,9 +177,11 @@ final class HazelRegistryStore: @unchecked Sendable {
     /// Re-resolve every live surface against the freshly scanned library:
     /// video changed on disk -> switch in place; surface still showing the
     /// no-video placeholder -> attach a renderer now.
+    /// Debounced: rapid library-changed signals coalesce into one retarget.
     func retargetToLibrary() {
-        // Hop to the lifecycle queue; surfaces are owned there.
-        HazelLifecycle.queue.async {
+        lock.lock()
+        retargetLibraryWork?.cancel()
+        let work = DispatchWorkItem {
             let store = HazelSurfaceRegistry.shared
             store.lock.lock()
             let pairs = store.surfaces.map { ($0.key, $0.value) }
@@ -216,13 +220,19 @@ final class HazelRegistryStore: @unchecked Sendable {
                 }
             }
         }
+        retargetLibraryWork = work
+        lock.unlock()
+        // Hop to the lifecycle queue; surfaces are owned there. Debounce so a
+        // burst of library-changed signals runs one retarget, never stacked.
+        HazelLifecycle.queue.asyncAfter(deadline: .now() + 0.25, execute: work)
     }
 
     /// Recompute pause/play for every live surface from current mode + prefs.
-    /// Called when hazel-prefs.json changes.
+    /// Called when hazel-prefs.json changes. Debounced like retargetToLibrary.
     func retargetAll() {
-        // Hop to the lifecycle queue; surfaces are owned there.
-        HazelLifecycle.queue.async {
+        lock.lock()
+        retargetAllWork?.cancel()
+        let work = DispatchWorkItem {
             let store = HazelSurfaceRegistry.shared
             store.lock.lock()
             let pairs = store.surfaces.map { ($0.key, $0.value) }
@@ -234,18 +244,27 @@ final class HazelRegistryStore: @unchecked Sendable {
                 ))
             }
         }
+        retargetAllWork = work
+        lock.unlock()
+        // Hop to the lifecycle queue; surfaces are owned there.
+        HazelLifecycle.queue.asyncAfter(deadline: .now() + 0.15, execute: work)
     }
 
     func updateAll(mode: HazelPresentationMode, activity: HazelActivityState) {
-        lock.lock()
-        let all = Array(surfaces.values)
-        lock.unlock()
-        for surface in all {
-            surface.mode = mode
-            surface.activity = activity
-            surface.renderer?.setPaused(!HazelPolicy.shouldPlay(
-                mode: mode, activity: activity, prefs: HazelPrefsSource.current,
-            ))
+        // Surface mode/activity are owned by the lifecycle queue; mutate there
+        // so a burst of updates serializes with acquire/update/invalidate.
+        HazelLifecycle.queue.async { [mode, activity] in
+            let store = HazelSurfaceRegistry.shared
+            store.lock.lock()
+            let all = Array(store.surfaces.values)
+            store.lock.unlock()
+            for surface in all {
+                surface.mode = mode
+                surface.activity = activity
+                surface.renderer?.setPaused(!HazelPolicy.shouldPlay(
+                    mode: mode, activity: activity, prefs: HazelPrefsSource.current,
+                ))
+            }
         }
     }
 
@@ -325,12 +344,14 @@ final class HazelWallpaperHandler: NSObject, WallpaperExtensionXPCProtocol {
         var videoURL = HazelLibrary.shared.videoURL(forChoice: choice)
         if videoURL == nil {
             // Lock-time race: the agent can spawn us in the middle of the
-            // app's atomic library.json/video replace. The init-time scan may
-            // have seen the pre-rename state. Re-scan once after a short
-            // delay before giving up — one retry covers the rename window
-            // without stalling the serial queue.
-            hazelLog("  [acquire] no usable video for choice \(choice ?? "nil") entries=\(HazelLibrary.shared.entries.count) display=\(displayID.map(String.init) ?? "nil") — re-scan + retry once")
-            Thread.sleep(forTimeInterval: 0.35)
+            // app's atomic library.json/video replace. An init-time scan may
+            // have seen the pre-rename state, so re-scan immediately — this
+            // covers already-completed renames without stalling the serial
+            // lifecycle queue (no Thread.sleep here: every other surface's
+            // acquire/update/invalidate would wait). A still-missing file is
+            // a genuine mid-copy window: CREATE seeds a placeholder and
+            // schedules a short delayed re-scan below.
+            hazelLog("  [acquire] no usable video for choice \(choice ?? "nil") entries=\(HazelLibrary.shared.entries.count) display=\(displayID.map(String.init) ?? "nil") — immediate re-scan (no queue block)")
             HazelLibrary.shared.scan()
             videoURL = HazelLibrary.shared.videoURL(forChoice: choice)
             if videoURL == nil {
@@ -347,7 +368,7 @@ final class HazelWallpaperHandler: NSObject, WallpaperExtensionXPCProtocol {
         // staying a still forever if that update is lost; starting playing
         // self-corrects on the desktop via the first update's pause. Locked
         // and idle ALWAYS play per policy, so playing is the safe default.
-        let startPaused = false
+        _ = false as Bool // startPaused always false: fail toward playing
 
         // ---- REUSE: this surface's context already exists ----
         if let existing = registry.surface(for: key) {
@@ -414,105 +435,144 @@ final class HazelWallpaperHandler: NSObject, WallpaperExtensionXPCProtocol {
         // NOTE: remoteContext + layer tree are built on the main thread. Core
         // Animation layer trees that cross into the WindowServer must be
         // created on the main thread; the lifecycle serial queue is a worker.
-        let built: (CAContext, CALayer, UInt32)? = DispatchQueue.main.sync {
+        // Async (never main.sync): blocking the lifecycle queue on main
+        // deadlocks when main waits on lifecycle work and stalls every other
+        // surface. Reply happens in the lifecycle continuation below.
+        let createDestSize = destSize
+        let createScale = scale
+        let createSurfaceUUID = surfaceUUID
+        let createKey = key
+        let createChoice = choice
+        let createVideoURL = videoURL
+        let createIsPreview = isPreview
+        let boxedHandler = HazelSendableBox(value: self)
+        DispatchQueue.main.async {
             guard let caContext = CAContext.remoteContext() as? CAContext, caContext.contextId != 0 else {
-                return nil
+                HazelLifecycle.queue.async {
+                    hazelLog("  ERROR: remote CAContext creation failed")
+                    reply(nil, NSError(domain: "HazelWallpaperExtension", code: 4,
+                                       userInfo: [NSLocalizedDescriptionKey: "Failed to create remote CAContext"]))
+                }
+                return
             }
             let rootLayer = CALayer()
-            rootLayer.frame = CGRect(origin: .zero, size: destSize)
-            rootLayer.contentsScale = scale
+            rootLayer.frame = CGRect(origin: .zero, size: createDestSize)
+            rootLayer.contentsScale = createScale
             rootLayer.contentsGravity = .resizeAspectFill
             caContext.layer = rootLayer
             CATransaction.flush()
-            return (caContext, rootLayer, caContext.contextId)
-        }
-        guard let (caContext, rootLayer, contextId) = built else {
-            hazelLog("  ERROR: remote CAContext creation failed")
-            reply(nil, NSError(domain: "HazelWallpaperExtension", code: 4,
-                               userInfo: [NSLocalizedDescriptionKey: "Failed to create remote CAContext"]))
-            return
-        }
-
-        guard let replyObj = hazelCreateRemoteContextXPC(contextId: contextId) else {
-            reply(nil, NSError(domain: "HazelWallpaperExtension", code: 3, userInfo: nil)); return
-        }
-
-        let hosted = HazelHostedSurface(caContext: caContext, contextId: contextId,
-                                        rootLayer: rootLayer, destSize: destSize, scale: scale)
-        registry.install(hosted, for: key, wallpaperID: surfaceUUID)
-        hazelLog("  Created context \(contextId) for \(key) at \(destSize) @\(scale)x")
-
-        if isPreview {
-            // Settings preview: seed a still and stop. No decode loop, no looper.
-            seedPreviewStill(into: rootLayer, size: destSize, videoURL: videoURL, reply: reply, replyObj: replyObj)
-            return
-        }
-
-        guard let videoURL else {
-            // No video staged: solid fallback. Static, so ready at once.
-            // Tracked as the placeholder so a later stage removes it.
-            let gradient = CAGradientLayer()
-            gradient.colors = [
-                CGColor(red: 0.15, green: 0.1, blue: 0.25, alpha: 1.0),
-                CGColor(red: 0.05, green: 0.1, blue: 0.2, alpha: 1.0),
-            ]
-            gradient.frame = CGRect(origin: .zero, size: destSize)
-            CATransaction.begin(); CATransaction.setDisableActions(true)
-            rootLayer.addSublayer(gradient)
-            CATransaction.commit(); CATransaction.flush()
-            hosted.placeholder = gradient
-            reply(replyObj, nil)
-            return
-        }
-
-        if registry.claimRendererCreate(for: key) {
+            let boxedContext = HazelSendableBox(value: caContext)
             let boxedRoot = HazelSendableBox(value: rootLayer)
-            let boxedReply = HazelSendableBox(value: replyObj)
-            let boxedKey = HazelSendableBox(value: key)
-            let boxedChoice = HazelSendableBox(value: choice)
-            // Cold start: reply ONLY after the first frame is composited.
-            // Replying earlier lets the agent host an empty context (black).
-            // The seed is infallible (cached frame → solid color), and start()
-            // resolves after the first enqueue+flush, so the reply below
-            // always follows a composited frame. Switch racing a live surface
-            // is covered by REUSE above.
-            Task {
-                do {
-                    let renderer = try await HazelVideoRenderer.create(
-                        rootLayer: boxedRoot.value, videoURL: videoURL,
-                    )
-                    let old = registry.setRenderer(renderer, videoID: boxedChoice.value, for: boxedKey.value)
-                    old?.stop()
-                    if let surface = registry.surface(for: boxedKey.value) {
-                        surface.placeholder?.removeFromSuperlayer()
-                        surface.placeholder = nil
+            HazelLifecycle.queue.async {
+                let caContext = boxedContext.value
+                let rootLayer = boxedRoot.value
+                let contextId = caContext.contextId
+                let registry = HazelSurfaceRegistry.shared
+                guard let replyObj = hazelCreateRemoteContextXPC(contextId: contextId) else {
+                    reply(nil, NSError(domain: "HazelWallpaperExtension", code: 3, userInfo: nil)); return
+                }
+
+                let hosted = HazelHostedSurface(caContext: caContext, contextId: contextId,
+                                                rootLayer: rootLayer, destSize: createDestSize, scale: createScale)
+                registry.install(hosted, for: createKey, wallpaperID: createSurfaceUUID)
+                hazelLog("  Created context \(contextId) for \(createKey) at \(createDestSize) @\(createScale)x")
+
+                if createIsPreview {
+                    // Settings preview: seed a still and stop. No decode loop, no looper.
+                    boxedHandler.value.seedPreviewStill(into: rootLayer, size: createDestSize, videoURL: createVideoURL, reply: reply, replyObj: replyObj)
+                    return
+                }
+
+                guard let videoURL = createVideoURL else {
+                    // No video staged: solid fallback on main, then reply.
+                    // Tracked as the placeholder so a later stage removes it.
+                    let boxedReply2 = HazelSendableBox(value: replyObj)
+                    DispatchQueue.main.async {
+                        let gradient = CAGradientLayer()
+                        gradient.colors = [
+                            CGColor(red: 0.15, green: 0.1, blue: 0.25, alpha: 1.0),
+                            CGColor(red: 0.05, green: 0.1, blue: 0.2, alpha: 1.0),
+                        ]
+                        gradient.frame = CGRect(origin: .zero, size: createDestSize)
+                        CATransaction.begin(); CATransaction.setDisableActions(true)
+                        rootLayer.addSublayer(gradient)
+                        CATransaction.commit(); CATransaction.flush()
+                        HazelLifecycle.queue.async {
+                            HazelSurfaceRegistry.shared.surface(for: createKey)?.placeholder = gradient
+                            reply(boxedReply2.value, nil)
+                            // Mid-copy window: the staged file may land just after this
+                            // reply. Re-scan shortly and retarget so the video attaches
+                            // without waiting for the next library-changed signal.
+                            // asyncAfter, never sleep: the lifecycle queue stays live.
+                            HazelLifecycle.queue.asyncAfter(deadline: .now() + 0.35) {
+                                HazelLibrary.shared.scan()
+                                HazelSurfaceRegistry.shared.retargetToLibrary()
+                            }
+                        }
                     }
-                    if startPaused { renderer.setPaused(true) }
-                    await renderer.start()
-                    hazelLog("  [acquire] CREATE first-frame composited (video \(videoURL.lastPathComponent)), replying ctx=\(contextId)")
-                    reply(boxedReply.value, nil)
-                } catch {
-                    // create() throws BEFORE installing any layer (no track /
-                    // mid-copy file). Replying now would host an empty context
-                    // = BLACK on the lockscreen, permanently (no retry was
-                    // scheduled). Seed the gradient fallback so the surface
-                    // never presents empty, then rely on the next
-                    // library-changed signal (retargetToLibrary) to attach.
-                    hazelLog("  [Renderer] CREATE failed for \(videoURL.lastPathComponent): \(error) — gradient fallback, replying (never empty-black)")
-                    Self.ensureGradientPlaceholder(for: key, size: destSize)
-                    registry.clearRendererPending(for: key)
-                    reply(boxedReply.value, nil)
+                    return
+                }
+
+                if registry.claimRendererCreate(for: createKey) {
+                    let boxedRoot2 = HazelSendableBox(value: rootLayer)
+                    let boxedReply = HazelSendableBox(value: replyObj)
+                    let boxedKey = HazelSendableBox(value: createKey)
+                    let boxedChoice = HazelSendableBox(value: createChoice)
+                    let boxedSeedSize = HazelSendableBox(value: createDestSize)
+                    let createT0 = Date()
+                    // Cold-start fast start: reply after the STILL is composited
+                    // (create installs an infallible still — cached frame →
+                    // solid color — so the hosted context is never empty/black),
+                    // then refine with full-res video frames after. Blocking the
+                    // reply on the first full-4K video decode serializes two
+                    // HEVC decodes + a PNG persist before the agent may host us
+                    // (the ~8s cold); the still already satisfies
+                    // transparent-until-ready, and start() refines it in place
+                    // on the same layer. Switch racing a live surface is
+                    // covered by REUSE above.
+                    Task {
+                        do {
+                            let renderer = try await HazelVideoRenderer.create(
+                                rootLayer: boxedRoot2.value, videoURL: videoURL,
+                                seedTargetSize: boxedSeedSize.value,
+                            )
+                            let old = registry.setRenderer(renderer, videoID: boxedChoice.value, for: boxedKey.value)
+                            old?.stop()
+                            if let surface = registry.surface(for: boxedKey.value) {
+                                surface.placeholder?.removeFromSuperlayer()
+                                surface.placeholder = nil
+                            }
+                            hazelLog("  [acquire] CREATE still composited (seed \(videoURL.lastPathComponent)), replying ctx=\(contextId) in \(String(format: "%.2f", Date().timeIntervalSince(createT0)))s — video refines after")
+                            reply(boxedReply.value, nil)
+                            await renderer.start()
+                            hazelLog("  [acquire] CREATE first-frame VIDEO composited (video \(videoURL.lastPathComponent)) in \(String(format: "%.2f", Date().timeIntervalSince(createT0)))s")
+                        } catch {
+                            // create() throws BEFORE installing any layer (no track /
+                            // mid-copy file). Replying now would host an empty context
+                            // = BLACK on the lockscreen, permanently (no retry was
+                            // scheduled). Seed the gradient fallback so the surface
+                            // never presents empty, then rely on the next
+                            // library-changed signal (retargetToLibrary) to attach.
+                            hazelLog("  [Renderer] CREATE failed for \(videoURL.lastPathComponent): \(error) — gradient fallback, replying (never empty-black)")
+                            Self.ensureGradientPlaceholder(for: createKey, size: createDestSize) {
+                                registry.clearRendererPending(for: boxedKey.value)
+                                reply(boxedReply.value, nil)
+                            }
+                        }
+                    }
+                } else {
+                    // Defensive: claim failed on a fresh surface (second CREATE racing
+                    // the first on the serial queue should be impossible — it would
+                    // have hit REUSE — but fail toward a visible gradient, never an
+                    // empty reply).
+                    hazelLog("  [acquire] CREATE claim contention for \(createKey) — gradient fallback, replying (never empty-black)")
+                    Self.ensureGradientPlaceholder(for: createKey, size: createDestSize) {
+                        reply(replyObj, nil)
+                    }
                 }
             }
-        } else {
-            // Defensive: claim failed on a fresh surface (second CREATE racing
-            // the first on the serial queue should be impossible — it would
-            // have hit REUSE — but fail toward a visible gradient, never an
-            // empty reply).
-            hazelLog("  [acquire] CREATE claim contention for \(key) — gradient fallback, replying (never empty-black)")
-            Self.ensureGradientPlaceholder(for: key, size: destSize)
-            reply(replyObj, nil)
         }
+        return
     }
 
     /// Seed a Settings preview surface with one still frame: no renderer, no
@@ -531,7 +591,12 @@ final class HazelWallpaperHandler: NSObject, WallpaperExtensionXPCProtocol {
         let boxedReply = HazelSendableBox(value: replyObj)
         let boxedSize = HazelSendableBox(value: size)
         Task {
-            let still = await HazelSnapshot.seedImage(videoURL: videoURL)
+            // Preview decodes at display size, not full 4K: the still is only
+            // ever shown scaled into `size`, so a full-res hvc1 decode is pure
+            // cold cost on the preview path too.
+            let still = await HazelSnapshot.seedImage(
+                videoURL: videoURL,
+                maximumSize: HazelSnapshot.seedSize(forDestination: boxedSize.value))
             DispatchQueue.main.async {
                 boxedRoot.value.contents = still
                 boxedRoot.value.contentsGravity = .resizeAspectFill
@@ -553,7 +618,9 @@ final class HazelWallpaperHandler: NSObject, WallpaperExtensionXPCProtocol {
         hazelLog("  [acquire] attachRenderer start \(key) choice=\(choice ?? "nil") url=\(videoURL.lastPathComponent) startPaused=\(startPaused)")
         let registry = HazelSurfaceRegistry.shared
         do {
-            let renderer = try await HazelVideoRenderer.create(rootLayer: rootLayer, videoURL: videoURL)
+            let seedSize: CGSize? = registry.surface(for: key).map { HazelSnapshot.seedSize(forDestination: $0.destSize) }
+            let renderer = try await HazelVideoRenderer.create(rootLayer: rootLayer, videoURL: videoURL,
+                                                               seedTargetSize: seedSize)
             let old = registry.setRenderer(renderer, videoID: choice, for: key)
             old?.stop()
             if let surface = registry.surface(for: key) {
@@ -562,7 +629,7 @@ final class HazelWallpaperHandler: NSObject, WallpaperExtensionXPCProtocol {
             }
             if startPaused { renderer.setPaused(true) }
             await renderer.start()
-            hazelLog("  [acquire] attachRenderer done \(key): first-frame composited (video \(videoURL.lastPathComponent))")
+            hazelLog("  [acquire] attachRenderer done \(key): first-frame composited (still-then-video fast start \(videoURL.lastPathComponent))")
         } catch {
             hazelLog("  [Renderer] attach failed for \(videoURL.lastPathComponent): \(error) — placeholder kept, retry on next library signal")
             registry.clearRendererPending(for: key)
@@ -575,27 +642,40 @@ final class HazelWallpaperHandler: NSObject, WallpaperExtensionXPCProtocol {
     /// on every path that replies without a composited video frame, so a
     /// reply can never precede seeding. Layer work hops to main (remote
     /// contexts must be mutated there). No-op when content already exists.
-    static func ensureGradientPlaceholder(for key: HazelSurfaceKey, size: CGSize?) {
-        guard let surface = HazelSurfaceRegistry.shared.surface(for: key) else { return }
-        let work = {
+    /// Async (never main.sync): callers needing order pass a completion that
+    /// runs after the placeholder is installed.
+    static func ensureGradientPlaceholder(for key: HazelSurfaceKey, size: CGSize?,
+                                          completion: (@Sendable () -> Void)? = nil) {
+        guard let surface = HazelSurfaceRegistry.shared.surface(for: key) else {
+            completion?()
+            return
+        }
+        let frameSize = size ?? surface.destSize
+        let work: @Sendable () -> Void = {
             let hasContent = !(surface.rootLayer.sublayers?.isEmpty ?? true)
-            if hasContent { return }
-            if surface.placeholder != nil { return }
+            if hasContent {
+                completion?()
+                return
+            }
+            if surface.placeholder != nil {
+                completion?()
+                return
+            }
             let gradient = CAGradientLayer()
             gradient.colors = [
                 CGColor(red: 0.15, green: 0.1, blue: 0.25, alpha: 1.0),
                 CGColor(red: 0.05, green: 0.1, blue: 0.2, alpha: 1.0),
             ]
-            let frameSize = size ?? surface.destSize
             gradient.frame = CGRect(origin: .zero, size: frameSize)
             CATransaction.begin(); CATransaction.setDisableActions(true)
             surface.rootLayer.addSublayer(gradient)
             CATransaction.commit(); CATransaction.flush()
             surface.placeholder = gradient
             hazelLog("  [acquire] gradient placeholder installed for \(key) (never empty-black)")
+            completion?()
         }
         if Thread.isMainThread { work() }
-        else { DispatchQueue.main.sync(execute: work) }
+        else { DispatchQueue.main.async(execute: work) }
     }
 
     // MARK: update

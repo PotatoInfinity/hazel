@@ -53,7 +53,7 @@ final class HazelVideoRenderer: @unchecked Sendable {
     private var ptsOffset: CMTime = .zero
     private var lastEnqueuedEnd: CMTime = .zero
 
-    static func create(rootLayer: CALayer, videoURL: URL) async throws -> HazelVideoRenderer {
+    static func create(rootLayer: CALayer, videoURL: URL, seedTargetSize: CGSize? = nil) async throws -> HazelVideoRenderer {
         // Zero-byte mid-copy stage: fail fast with a distinct log (caller
         // seeds a gradient and retries on the next library signal) instead of
         // letting loadTracks throw a generic error on an empty reply path.
@@ -63,15 +63,36 @@ final class HazelVideoRenderer: @unchecked Sendable {
                 NSLocalizedDescriptionKey: "Zero-byte (mid-copy) file \(videoURL.lastPathComponent)",
             ])
         }
+        // Cold-path profile (3724x1964 hvc1 direct-run ≈ 8.4s before this
+        // change): serial loadTracks (moov parse, cold page cache) + FULL-RES
+        // generator still decode + FULL-RES reader first-sample decode + a
+        // synchronous PNG persist — all before the acquire reply. Fast start:
+        // (1) probe tracks and decode the still CONCURRENTLY on one shared
+        // asset (one open, one moov parse); (2) still decodes at the capped
+        // seed size, not full 4K; (3) the PNG persist is async (see
+        // HazelFrameCache.store); (4) the caller replies after the still is
+        // composited and refines with video frames after — so this function
+        // returns once the non-black still is up, not once video decodes.
+        let t0 = Date()
+        hazelLog("  [Renderer] create start \(videoURL.lastPathComponent)")
         let asset = AVURLAsset(url: videoURL)
+        let seedMax = seedTargetSize.map { HazelSnapshot.seedSize(forDestination: $0) }
+            ?? CGSize(width: HazelSnapshot.seedMaxWidth,
+                      height: HazelSnapshot.seedMaxWidth * 9 / 16)
+        async let tracksTask: [AVAssetTrack] = asset.loadTracks(withMediaType: .video)
+        async let stillTask: CGImage = HazelSnapshot.seedImage(
+            asset: asset, fallbackName: videoURL.lastPathComponent, maximumSize: seedMax)
         let tracks: [AVAssetTrack]
         do {
-            tracks = try await asset.loadTracks(withMediaType: .video)
+            tracks = try await tracksTask
         } catch {
-            hazelLog("  [Renderer] create failed: track load threw for \(videoURL.lastPathComponent): \(error) (mid-copy/corrupt?)")
+            _ = await stillTask // still is infallible; await to avoid a stray child decode
+            hazelLog("  [Renderer] create failed: track load threw for \(videoURL.lastPathComponent): \(error) (mid-copy/corrupt?) in \(String(format: "%.2f", Date().timeIntervalSince(t0)))s")
             throw error
         }
+        hazelLog("  [Renderer] tracks probed in \(String(format: "%.2f", Date().timeIntervalSince(t0)))s")
         guard let track = tracks.first else {
+            _ = await stillTask
             hazelLog("  [Renderer] create failed: no video track in \(videoURL.lastPathComponent) (mid-copy/corrupt?)")
             throw CocoaError(.fileReadCorruptFile, userInfo: [
                 NSLocalizedDescriptionKey: "No video track found in \(videoURL.lastPathComponent)",
@@ -83,9 +104,10 @@ final class HazelVideoRenderer: @unchecked Sendable {
         // AVSampleBufferDisplayLayer content composites remotely.
         // INFALLIBLE: seedImage falls back to cached last-good frame, then
         // solid color — never nil, so the layer always has content.
-        hazelLog("  [Renderer] create \(videoURL.lastPathComponent): seeding still")
-        let still: CGImage = await HazelSnapshot.seedImage(videoURL: videoURL)
-        hazelLog("  [Renderer] still seeded \(still.width)x\(still.height)")
+        // Runs CONCURRENTLY with the track probe above (async let), so the
+        // still decode overlaps the moov parse instead of following it.
+        let still: CGImage = await stillTask
+        hazelLog("  [Renderer] still seeded \(still.width)x\(still.height) in \(String(format: "%.2f", Date().timeIntervalSince(t0)))s")
         return HazelVideoRenderer(rootLayer: rootLayer, asset: asset, videoTrack: track, stillImage: still)
     }
 
@@ -228,12 +250,13 @@ final class HazelVideoRenderer: @unchecked Sendable {
 
     /// Re-frame the video layer to a new destination geometry. Layer-tree work
     /// must happen on the main thread; the lifecycle queue calls here, so hop.
+    /// Async (never sync) to avoid stalling the lifecycle queue on main.
     func resize(to destSize: CGSize, scale: CGFloat) {
         guard !Thread.isMainThread else {
             resizeOnMain(to: destSize, scale: scale)
             return
         }
-        DispatchQueue.main.sync {
+        DispatchQueue.main.async { [self] in
             self.resizeOnMain(to: destSize, scale: scale)
         }
     }
@@ -250,6 +273,8 @@ final class HazelVideoRenderer: @unchecked Sendable {
     /// Switch to a different video in place, reusing this `displayLayer`. A
     /// fresh AVSampleBufferDisplayLayer added to an already-hosted context does
     /// not composite, so the layer must be reused.
+    /// Probe off-queue: track load + one-frame decode run on a utility queue
+    /// so the renderer queue (and live playback) never stalls on I/O.
     func switchVideo(to url: URL) {
         hazelLog("[Renderer] switchVideo start → \(url.lastPathComponent)")
         queue.async { [self] in
@@ -261,22 +286,56 @@ final class HazelVideoRenderer: @unchecked Sendable {
                 hazelLog("[Renderer] switchVideo ignored: same URL")
                 return
             }
-            open(url)
+            switchEpoch &+= 1
+            let epoch = switchEpoch
+            let target = url
+            // Probe off-queue at background QoS: the one-frame decode warms the page
+            // cache for the swap, but must never contend the live playback
+            // decode (or the first-frame decode) for priority.
+            DispatchQueue.global(qos: .background).async { [weak self] in
+                guard let self else { return }
+                let newAsset = AVURLAsset(url: target)
+                guard let track = Self.loadFirstVideoTrackBlocking(newAsset) else {
+                    hazelLog("[Renderer] switchVideo aborted: no video track in \(target.lastPathComponent) — keeping current video")
+                    return
+                }
+                // Guard against a file that exists but has zero readable frames
+                // (mid-copy stage): probe one frame before committing to the swap.
+                guard Self.probeFirstSample(asset: newAsset, track: track) != nil else {
+                    hazelLog("[Renderer] switchVideo aborted: no decodable frame in \(target.lastPathComponent) (mid-write?) — keeping current video, will retry on next library signal")
+                    return
+                }
+                self.queue.async { [weak self] in
+                    guard let self, isRunning, switchEpoch == epoch else { return }
+                    if asset.url == target {
+                        hazelLog("[Renderer] switchVideo ignored: same URL (superseded probe)")
+                        return
+                    }
+                    asset = newAsset
+                    videoTrack = track
+                    restartWithCurrentAsset()
+                }
+            }
         }
     }
+
+    /// Monotonically increasing switch id: off-queue probes racing each other
+    /// — only the newest may commit. Touched on `queue` + captured off-queue.
+    private var switchEpoch = 0
 
     /// Open `url` as the current asset and restart from its first frame.
     /// The track load is validated BEFORE touching the live pipeline, so a
     /// corrupt/mid-write file never tears down the currently showing video.
+    /// NOTE: switchVideo probes off-queue then commits via this path on `queue`.
     private func open(_ url: URL) {
         hazelLog("[Renderer] open \(url.lastPathComponent)")
         let newAsset = AVURLAsset(url: url)
+        // Synchronous fallback when already on `queue` (should be rare now
+        // that switchVideo probes off-queue first). Kept for internal callers.
         guard let track = Self.loadFirstVideoTrackBlocking(newAsset) else {
             hazelLog("[Renderer] switchVideo aborted: no video track in \(url.lastPathComponent) — keeping current video")
             return
         }
-        // Guard against a file that exists but has zero readable frames
-        // (mid-copy stage): probe one frame before committing to the swap.
         guard Self.probeFirstSample(asset: newAsset, track: track) != nil else {
             hazelLog("[Renderer] switchVideo aborted: no decodable frame in \(url.lastPathComponent) (mid-write?) — keeping current video, will retry on next library signal")
             return
@@ -287,16 +346,18 @@ final class HazelVideoRenderer: @unchecked Sendable {
     }
 
     /// Decode (then discard) one frame to prove the asset is readable. Runs
-    /// on `queue`; opens a throwaway reader so the live pipeline is untouched.
-    private static func probeFirstSample(asset: AVURLAsset, track: AVAssetTrack) -> Bool? {
-        guard let reader = try? AVAssetReader(asset: asset) else { return nil }
-        let output = AVAssetReaderTrackOutput(track: track, outputSettings: nil)
-        output.alwaysCopiesSampleData = false
-        reader.add(output)
-        guard reader.startReading() else { return nil }
-        let sample = output.copyNextSampleBuffer()
-        reader.cancelReading()
-        return sample.map { _ in true }
+    /// OFF `queue` (utility probe); opens a throwaway reader so the live
+    /// pipeline is untouched and never stalls.
+    /// LOW-COST probe: a 320p generator decode proves the file is past its
+    /// mid-copy window and warms the page cache without paying a full-4K
+    /// reader decode per switch. The full-res decode happens once, in the
+    /// commit (restartWithCurrentAsset), not twice.
+    private static func probeFirstSample(asset: AVURLAsset, track _: AVAssetTrack) -> Bool? {
+        let generator = AVAssetImageGenerator(asset: asset)
+        generator.appliesPreferredTrackTransform = true
+        generator.maximumSize = CGSize(width: 320, height: 180)
+        guard (try? generator.copyCGImage(at: .zero, actualTime: nil)) != nil else { return nil }
+        return true
     }
 
     /// Tag a sample buffer so the renderer displays it immediately, replacing
@@ -316,10 +377,9 @@ final class HazelVideoRenderer: @unchecked Sendable {
         }
     }
 
-    /// Load the first video track synchronously. Call ONLY on the renderer's
-    /// serial `queue` (a real, owned thread that already blocks for decodes):
-    /// the blocking window is one cached metadata read, and making this async
-    /// would let a switch race the loop restart it is meant to precede.
+    /// Load the first video track synchronously. Called OFF the renderer's
+    /// serial `queue` (utility queue probe): the blocking window is one cached
+    /// metadata read, keeping live decode/loop work unblocked. Thread-safe.
     private static func loadFirstVideoTrackBlocking(_ asset: AVURLAsset) -> AVAssetTrack? {
         let sem = DispatchSemaphore(value: 0)
         nonisolated(unsafe) var result: AVAssetTrack?
@@ -331,15 +391,14 @@ final class HazelVideoRenderer: @unchecked Sendable {
         return result
     }
 
-    /// Stop playback for good. Synchronous with the renderer queue so no
-    /// callback is mid-flight when the readers are cancelled. Must not be
-    /// called on that queue. Layer-tree removal hops to the main thread.
-    /// NOTE: the last composited frame stays in the torn-down layer; the
-    /// context itself is going away (invalidate grace fired), so no black is
-    /// observable — the host drops the context right after.
+    /// Stop playback for good. Async with the renderer queue (never sync) so
+    /// teardown on the lifecycle queue never blocks; layer-tree removal hops
+    /// to main async. NOTE: the last composited frame stays in the torn-down
+    /// layer; the context itself is going away (invalidate grace fired), so no
+    /// black is observable — the host drops the context right after.
     func stop() {
         hazelLog("[Renderer] stop")
-        queue.sync {
+        queue.async { [self] in
             isRunning = false
             cancelDeepPauseTimer()
             renderer.stopRequestingMediaData()
@@ -349,7 +408,7 @@ final class HazelVideoRenderer: @unchecked Sendable {
         if Thread.isMainThread {
             displayLayer.removeFromSuperlayer()
         } else {
-            DispatchQueue.main.sync {
+            DispatchQueue.main.async { [self] in
                 self.displayLayer.removeFromSuperlayer()
             }
         }
@@ -581,11 +640,14 @@ final class HazelVideoRenderer: @unchecked Sendable {
 
     // MARK: - Preloaded loop reader
 
-    /// Deferred to a separate queue job so the brief blocking track load
-    /// doesn't stall the caller — still strictly ordered on `queue`.
+    /// Lazy pre-roll: deferred off the first-frame critical path so a second
+    /// reader/decoder isn't allocated while the switch still is compositing.
+    /// Still strictly ordered on `queue`; skipped while paused/deep-paused.
+    /// 1s (not 0.4s) keeps the pre-roll decode burst off the swap vsync.
     private func prepareNextReader() {
-        queue.async { [weak self] in
-            guard let self, isRunning else { return }
+        queue.asyncAfter(deadline: .now() + 1.0) { [weak self] in
+            guard let self, isRunning, !isPaused else { return }
+            guard nextReader == nil else { return }
             installNextReader(asset: asset, track: videoTrack)
         }
     }
@@ -659,10 +721,20 @@ final class HazelVideoRenderer: @unchecked Sendable {
             }
 
             if renderer.requiresFlushToResumeDecoding {
-                renderer.flush()
+                // Never drop the displayed image here: the default
+                // flush(removingDisplayedImage:true) blanks to black.
+                renderer.flush(removingDisplayedImage: false)
             }
 
+            // Cap the decode burst per callback: an unbounded while loop can
+            // decode the whole file in one wakeup (CPU spike + memory + jank).
+            // Enqueue a few frames, then yield for the next ready callback.
+            // 4 (not 8) halves the per-wakeup CPU spike so a burst never
+            // straddles a vsync and drops the ImageQueue frame.
+            var enqueuedThisBurst = 0
+            let maxBurst = 4
             while renderer.isReadyForMoreMediaData {
+                if enqueuedThisBurst >= maxBurst { break }
                 if let sample = currentOutput?.copyNextSampleBuffer() {
                     let adjusted = offsetTimingForLoop(sample)
                     let pts = CMSampleBufferGetPresentationTimeStamp(adjusted)
@@ -676,6 +748,7 @@ final class HazelVideoRenderer: @unchecked Sendable {
                         }
                     }
                     renderer.enqueue(adjusted)
+                    enqueuedThisBurst += 1
                 } else {
                     // Reader exhausted — loop boundary. Dispatched async:
                     // requestMediaDataWhenReady is not reentrant.
@@ -690,13 +763,17 @@ final class HazelVideoRenderer: @unchecked Sendable {
     }
 
     /// Offset both DTS and PTS of a sample for gapless looping. Returns the
-    /// original sample unchanged for the first loop (no copy needed); later
-    /// loops share the underlying data buffer, only timing metadata differs.
+    /// original sample unchanged for the first loop (no copy needed) and when
+    /// neither timestamp is valid; later loops share the underlying data buffer
+    /// (zero-copy payload), only timing metadata differs. The offset keeps PTS
+    /// monotonic against the control timebase (rate 1 from zero) so frames are
+    /// never judged late after a loop.
     private func offsetTimingForLoop(_ sample: CMSampleBuffer) -> CMSampleBuffer {
         guard ptsOffset > .zero else { return sample }
 
         let pts = CMSampleBufferGetPresentationTimeStamp(sample)
         let dts = CMSampleBufferGetDecodeTimeStamp(sample)
+        guard pts.isValid || dts.isValid else { return sample }
         let dur = CMSampleBufferGetDuration(sample)
 
         var timingInfo = CMSampleTimingInfo(

@@ -39,6 +39,24 @@ class HazelSaverView: ScreenSaverView {
     private var playbackFailed = false
     private var actualIsPreview: Bool = true
     private var started = false
+    /// Mid-run retarget: the app rewrites the pointer on every switch — even
+    /// obscured (deferred-decode) ones — so a running saver would otherwise
+    /// play the previous video until the next start. The replacement player
+    /// prewarms hidden and promotes only on ready (no unready swap); a
+    /// failure discards it and keeps the current video.
+    private var nextPlayer: AVQueuePlayer?
+    private var nextLooper: AVPlayerLooper?
+    private var nextLayer: AVPlayerLayer?
+    private var nextItem: AVPlayerItem?
+    private var nextItemObservation: NSKeyValueObservation?
+    private var nextFailedObserver: NSObjectProtocol?
+    private var nextURL: URL?
+    /// Polls the pointer for mid-run switches (2s, main thread, one stat when
+    /// healthy). Resolve itself runs on pointerResolveQueue (serial
+    /// background) so getpwuid + directory scans never race each other or
+    /// hitch main at presentation. Started on full-mode start, stopped on stop/deinit.
+    private var pointerPollTimer: Timer?
+    private let pointerResolveQueue = DispatchQueue(label: "com.live.hazel.saver.pointer-resolve", qos: .background)
 
     override init(frame: NSRect, isPreview: Bool) {
         var preview = isPreview
@@ -52,7 +70,7 @@ class HazelSaverView: ScreenSaverView {
         super.init(frame: frame, isPreview: preview)!
         wantsLayer = true
         layer?.backgroundColor = NSColor.black.cgColor
-        animationTimeInterval = 1.0 / 30.0
+        animationTimeInterval = 0
         Self.log("init preview=\(preview) frame=\(Int(frame.width))x\(Int(frame.height))")
         if !actualIsPreview, frame != .zero {
             _ = prewarmPlayer()
@@ -64,7 +82,7 @@ class HazelSaverView: ScreenSaverView {
         super.init(coder: coder)
         wantsLayer = true
         layer?.backgroundColor = NSColor.black.cgColor
-        animationTimeInterval = 1.0 / 30.0
+        animationTimeInterval = 0
         Self.log("init coder preview=true (no decode until start)")
     }
 
@@ -197,9 +215,11 @@ class HazelSaverView: ScreenSaverView {
         }
         let asset = AVURLAsset(url: url)
         let item = AVPlayerItem(asset: asset)
+        item.preferredForwardBufferDuration = 1.0
         let queuePlayer = AVQueuePlayer(playerItem: item)
         queuePlayer.isMuted = true
         queuePlayer.volume = 0
+        queuePlayer.automaticallyWaitsToMinimizeStalling = false
         if pointer?.isLooping != false {
             looper = AVPlayerLooper(player: queuePlayer, templateItem: item)
         }
@@ -265,6 +285,9 @@ class HazelSaverView: ScreenSaverView {
             playbackFailed = false
             player?.isMuted = true
             revealLayer()
+            // Re-apply occlusion policy at ready time: startAnimation may have
+            // run while occluded/hidden, so pause instead of playing overdraw.
+            applyOcclusionPolicy()
             Self.log("ready \(currentURL?.path ?? "?")")
         case .failed:
             handleItemFailure(reason: item.error?.localizedDescription ?? "item-failed")
@@ -297,6 +320,7 @@ class HazelSaverView: ScreenSaverView {
     }
 
     private func stopPlayer() {
+        stopNext()
         detachItemObservers()
         player?.pause()
         looper?.disableLooping()
@@ -351,13 +375,16 @@ class HazelSaverView: ScreenSaverView {
         if isReady {
             revealLayer()
         }
-        queuePlayer.play()
+        // Policy-gated: play only when visible/unoccluded; otherwise hold paused.
+        applyOcclusionPolicy()
+        startPointerPolling()
         Self.log("play start \(url.path)")
         if willStopObserver == nil {
             willStopObserver = DistributedNotificationCenter.default().addObserver(
                 forName: NSNotification.Name("com.apple.screensaver.willstop"),
                 object: nil, queue: .main
             ) { [weak self] _ in
+                self?.stopPointerPolling()
                 self?.stopPlayer()
                 self?.started = false
             }
@@ -366,6 +393,7 @@ class HazelSaverView: ScreenSaverView {
 
     override func stopAnimation() {
         super.stopAnimation()
+        stopPointerPolling()
         stopPlayer() // idempotent: safe when start never ran
         started = false
         if let observer = willStopObserver {
@@ -377,13 +405,173 @@ class HazelSaverView: ScreenSaverView {
     private func applyOcclusionPolicy() {
         guard started, !actualIsPreview, !playbackFailed, player != nil else { return }
         guard !isHiddenOrHasHiddenAncestor else { return }
-        let visible = window?.occlusionState.contains(.visible) ?? true
+        // No window yet (pre-attach): hold paused instead of playing over an
+        // occluded surface. viewDidMoveToWindow re-applies once attached.
+        let visible = window?.occlusionState.contains(.visible) ?? false
         if visible {
             player?.isMuted = true
             player?.play()
         } else {
             player?.pause() // covered: stop decoding, keep layer for instant resume
         }
+    }
+
+    /// Picks up a wallpaper switch that landed while running. Hidden/covered
+    /// rebuilds paused (nothing on screen to flash); visible ones hand off
+    /// through a hidden prewarm that promotes only when ready.
+    /// Vsync-safe: the pointer resolve (JSON decode + directory listing +
+    /// mtime sort) runs on a background queue, never on main at presentation
+    /// time. The timer fire itself stays a cheap main-thread guard + dispatch;
+    /// only a genuine URL change hops back to touch player state.
+    private func maybeReloadForPointerChange() {
+        guard started, !actualIsPreview, !playbackFailed, player != nil else { return }
+        let knownCurrent = currentURL?.path
+        let knownNext = nextURL?.path
+        pointerResolveQueue.async { [weak self] in
+            guard let (freshURL, freshPointer) = self?.resolveVideoURL(),
+                  self?.fileValidationError(for: freshURL) == nil else { return }
+            guard freshURL.path != knownCurrent, freshURL.path != knownNext else { return }
+            DispatchQueue.main.async { [weak self] in
+                self?.applyPointerChange(url: freshURL, pointer: freshPointer)
+            }
+        }
+    }
+
+    /// Main-thread half of the pointer poll: re-checks liveness (the poll may
+    /// have been stopped while the resolve was off-main) and promotes.
+    private func applyPointerChange(url freshURL: URL, pointer freshPointer: SaverPointer?) {
+        guard started, !actualIsPreview, !playbackFailed, player != nil else { return }
+        guard freshURL.path != currentURL?.path, freshURL.path != nextURL?.path else { return }
+        if isHiddenOrHasHiddenAncestor || !(window?.occlusionState.contains(.visible) ?? false) {
+            stopNext()
+            stopPlayer()
+            _ = buildPlayer(url: freshURL, pointer: freshPointer)
+            player?.pause()
+            applyOcclusionPolicy()
+            return
+        }
+        startHandoff(url: freshURL, pointer: freshPointer)
+    }
+
+    private func startHandoff(url: URL, pointer: SaverPointer?) {
+        stopNext()
+        let item = AVPlayerItem(asset: AVURLAsset(url: url))
+        item.preferredForwardBufferDuration = 1.0
+        let queuePlayer = AVQueuePlayer(playerItem: item)
+        queuePlayer.isMuted = true
+        queuePlayer.volume = 0
+        queuePlayer.automaticallyWaitsToMinimizeStalling = false
+        queuePlayer.pause() // prewarm only: promotes on ready, never plays hidden
+        let layer = AVPlayerLayer(player: queuePlayer)
+        layer.videoGravity = gravity(for: pointer?.fit ?? "Fill")
+        layer.frame = bounds
+        layer.opacity = 0 // hidden until ready; the live layer stays up meanwhile
+        nextPlayer = queuePlayer
+        nextItem = item
+        nextURL = url
+        if pointer?.isLooping != false {
+            nextLooper = AVPlayerLooper(player: queuePlayer, templateItem: item)
+        }
+        nextItemObservation = item.observe(\.status, options: [.new]) { [weak self] observed, _ in
+            DispatchQueue.main.async { [weak self] in self?.handleHandoffStatus(observed) }
+        }
+        nextFailedObserver = NotificationCenter.default.addObserver(
+            forName: .AVPlayerItemFailedToPlayToEndTime, object: item, queue: .main
+        ) { [weak self] note in
+            let reason = (note.userInfo?[AVPlayerItemFailedToPlayToEndTimeErrorKey] as? NSError)?.localizedDescription ?? "play-to-end-failed"
+            self?.discardNext(reason: reason)
+        }
+        self.layer?.addSublayer(layer)
+        nextLayer = layer
+        Self.log("handoff prewarm \(url.path)")
+    }
+
+    private func handleHandoffStatus(_ item: AVPlayerItem) {
+        guard item === nextItem else { return }
+        switch item.status {
+        case .readyToPlay:
+            promoteNext()
+        case .failed:
+            discardNext(reason: item.error?.localizedDescription ?? "handoff-item-failed")
+        case .unknown:
+            break
+        @unknown default:
+            break
+        }
+    }
+
+    /// Ready-gated promotion: the old player is torn down only now, so the
+    /// last good frame stays up until the first fresh frame is ready (no
+    /// black flash, no unready swap). Playback then follows the occlusion
+    /// policy (covered → stays paused).
+    private func promoteNext() {
+        guard let freshPlayer = nextPlayer, let layer = nextLayer, let freshURL = nextURL,
+              let freshItem = nextItem else { return }
+        detachItemObservers()
+        player?.pause()
+        looper?.disableLooping()
+        playerLayer?.removeFromSuperlayer()
+        player = freshPlayer
+        looper = nextLooper
+        playerLayer = layer
+        currentURL = freshURL
+        clearNextObservers()
+        nextPlayer = nil
+        nextLooper = nil
+        nextLayer = nil
+        nextItem = nil
+        nextURL = nil
+        isReady = true
+        playbackFailed = false
+        player?.isMuted = true
+        attachItemObservers(to: freshItem)
+        revealLayer()
+        applyOcclusionPolicy()
+        Self.log("handoff promote \(freshURL.path)")
+    }
+
+    private func discardNext(reason: String) {
+        guard nextPlayer != nil || nextLayer != nil else { return }
+        Self.log("handoff discard (\(reason)) keeping \(currentURL?.path ?? "?")")
+        stopNext()
+    }
+
+    private func clearNextObservers() {
+        nextItemObservation?.invalidate()
+        nextItemObservation = nil
+        if let token = nextFailedObserver {
+            NotificationCenter.default.removeObserver(token)
+            nextFailedObserver = nil
+        }
+    }
+
+    private func stopNext() {
+        clearNextObservers()
+        nextPlayer?.pause()
+        nextLooper?.disableLooping()
+        nextLayer?.removeFromSuperlayer()
+        nextPlayer = nil
+        nextLooper = nil
+        nextLayer = nil
+        nextItem = nil
+        nextURL = nil
+    }
+
+    private func startPointerPolling() {
+        guard pointerPollTimer == nil else { return }
+        let timer = Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) { [weak self] _ in
+            self?.maybeReloadForPointerChange()
+        }
+        // Wide leeway lets the system coalesce this wake with other timers
+        // instead of waking main on its own 2s cadence at presentation time.
+        timer.tolerance = 1.0
+        RunLoop.main.add(timer, forMode: .common)
+        pointerPollTimer = timer
+    }
+
+    private func stopPointerPolling() {
+        pointerPollTimer?.invalidate()
+        pointerPollTimer = nil
     }
 
     override func viewDidMoveToWindow() {
@@ -397,7 +585,15 @@ class HazelSaverView: ScreenSaverView {
             windowOcclusionObserver = NotificationCenter.default.addObserver(
                 forName: NSWindow.didChangeOcclusionStateNotification,
                 object: win, queue: .main
-            ) { [weak self] _ in self?.applyOcclusionPolicy() }
+            ) { [weak self] _ in
+                self?.maybeReloadForPointerChange()
+                self?.applyOcclusionPolicy()
+            }
+            // Attached late (window was nil at start): re-apply now that a
+            // visibility verdict exists, and pick up any switch that landed
+            // while unattached.
+            maybeReloadForPointerChange()
+            applyOcclusionPolicy()
         }
     }
 
@@ -410,6 +606,7 @@ class HazelSaverView: ScreenSaverView {
 
     override func viewDidUnhide() {
         super.viewDidUnhide()
+        maybeReloadForPointerChange()
         applyOcclusionPolicy()
     }
 
@@ -430,6 +627,9 @@ class HazelSaverView: ScreenSaverView {
 
     override func draw(_ rect: NSRect) {
         super.draw(rect)
+        // Skip the black fill once video content exists: overdraw that costs a
+        // full-screen fill every frame and can flash over the player layer.
+        guard playerLayer == nil else { return }
         NSColor.black.set()
         NSBezierPath(rect: bounds).fill()
         // Help text in preview only. Full mode stays pure black on failure
@@ -449,6 +649,8 @@ class HazelSaverView: ScreenSaverView {
     deinit {
         // Teardown order: notification observers first (no callbacks during
         // teardown), then KVO, then pause/loop-off/layer-remove, then nil.
+        stopPointerPolling()
+        stopNext()
         if let observer = willStopObserver {
             DistributedNotificationCenter.default().removeObserver(observer)
         }

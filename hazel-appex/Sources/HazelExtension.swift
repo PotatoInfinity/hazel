@@ -19,7 +19,11 @@ final class HazelWallpaperExtension: NSObject, AppExtension {
             HazelLibrary.shared.startObserving()
             HazelPrefsSource.start()
         } else {
-            hazelLog("INIT — dlopen failed: \(String(cString: dlerror()))")
+            if let err = dlerror() {
+                hazelLog("INIT — dlopen failed: \(String(cString: err))")
+            } else {
+                hazelLog("INIT — dlopen failed (no error info)")
+            }
         }
     }
 
@@ -70,7 +74,7 @@ struct HazelWallpaperExtensionConfig: AppExtensionConfiguration {
         allTypes.add(NSURL.self)
         allTypes.add(NSError.self)
 
-        let classes = allTypes as! Set<AnyHashable>
+        let classes: Set<AnyHashable> = Set(allTypes.compactMap { $0 as? AnyHashable })
         let selectors: [(Selector, Int, Bool)] = [
             (#selector(HazelWallpaperHandler.acquire(withId:request:reply:)), 0, false),
             (#selector(HazelWallpaperHandler.acquire(withId:request:reply:)), 1, false),
