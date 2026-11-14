@@ -11,6 +11,12 @@ A free & open source macOS live wallpaper app that plays videos as your desktop 
 - Mute/unmute audio
 - App Hides into menu bar
 - Low resource usage
+- Settings window (`Cmd+,` or menu bar > Hazel Settings): menu bar icon picker, wallpaper fit, system-wallpaper sync, cycling, screensaver + lockscreen
+- Wallpaper cycling: None, On Unlock, presets (Every 30 Minutes / Every Hour / Every 5 Hours), Daily time, or Custom interval
+- Optional system-wallpaper sync so the desktop stays consistent when Hazel quits or the screen locks
+- Hazel screensaver + video lockscreen: one toggle plays the current video in the screensaver and on the lock screen, with Re-apply and Restore backup
+- Customizable menu bar icon (Hazel Light/Dark plus minimal shapes)
+- Stability hardening: seamless playback, no black windows on missing files, launch prewarms the first frame before heavy follow-up work
 
 ## Installation
 
@@ -28,10 +34,13 @@ A free & open source macOS live wallpaper app that plays videos as your desktop 
 - Select a video to set it as your wallpaper
 - Right click a wallpaper for options (loop, mute, remove)
 - Use the menu bar to change wallpaper fit or toggle open on startup
+- Open Settings (`Cmd+,`) to pick a menu bar icon, toggle system-wallpaper sync, or configure cycling (None / On Unlock / presets / Daily / Custom)
+- To use the video screensaver + lockscreen: Settings > Screensaver and lockscreen > turn it on (Re-apply refreshes it, Restore backup returns to the system default)
 
 ## Requirements
 
 - macOS 13.0 or later
+- Video lockscreen + Hazel screensaver integration requires macOS 26
 
 ## Feedback
 
@@ -48,3 +57,7 @@ Pinterest: https://in.pinterest.com/kyurakatsuya/
 Instagram: https://www.instagram.com/_lunara28
 <br></br>
 **All rights belong to the respective creator**
+
+### Third-party code
+- Wallpaper extension ported from Phosphene (MIT, © 2026 kageroumado) — see `hazel-appex/LICENSE.Phosphene`
+- System wallpaper/saver store access via vendored PaperSaverKit (MIT, © 2025 PaperSaver Contributors) under `hazel/Vendor/PaperSaverKit`
